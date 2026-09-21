@@ -1,0 +1,23 @@
+services:
+  btf-device-gateway:
+    build: .
+    container_name: btf-device-gateway
+    restart: unless-stopped
+    environment:
+      BTF_DATA_DIR: /data
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://115.191.10.45}
+      NEW_API_BASE_URL: ${NEW_API_BASE_URL:-http://new-api:3000}
+      NEW_API_TOKEN: ${NEW_API_TOKEN}
+      INTERNAL_ADMIN_TOKEN: ${INTERNAL_ADMIN_TOKEN}
+      PAYMENT_INSTRUCTIONS: ${PAYMENT_INSTRUCTIONS:-请联系销售确认付款，订单确认后设备授权会自动延期。}
+    ports:
+      - "80:8080"
+    volumes:
+      - ./data:/data
+    networks:
+      - new-api-network
+
+networks:
+  new-api-network:
+    external: true
+
