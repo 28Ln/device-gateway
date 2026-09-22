@@ -23,21 +23,12 @@ python -m app.cli list-devices
 python -m app.cli approve-order ORDER_ID
 ```
 
-## Customer Pages
+## Device API
 
-- `/device` checks device authorization status.
-- `/device/pay` starts renewal flow.
 - `/api/device/status` returns JSON status for firmware or apps.
+- `/v1/*` validates a device API key, forwards to New API, and records usage.
 
-## Admin Pages
-
-- `/admin` dashboard
-- `/admin/users` create and inspect device owners
-- `/admin/devices` create, batch create, renew, disable, enable, rotate keys
-- `/admin/orders` approve renewal orders
-- `/admin/usage` inspect device usage
-
-Admin pages are served directly under `/admin`. `INTERNAL_ADMIN_TOKEN` is reserved for internal scripts.
+No standalone gateway admin pages are exposed. Device administration is handled by CLI until it is implemented inside the New API UI.
 
 ## Users and Device Binding
 
