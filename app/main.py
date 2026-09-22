@@ -353,8 +353,10 @@ def admin_login() -> HTMLResponse:
         """
 <h1>管理登录</h1>
 <form action="/admin/login" method="post">
-  <label>管理 Token</label>
-  <input name="token" type="password" autocomplete="off" required>
+  <label>账号</label>
+  <input name="username" autocomplete="username" required>
+  <label>密码</label>
+  <input name="password" type="password" autocomplete="current-password" required>
   <button type="submit">登录</button>
 </form>
 """,
@@ -362,11 +364,11 @@ def admin_login() -> HTMLResponse:
 
 
 @app.post("/admin/login")
-def admin_login_post(token: str = Form(...)) -> Response:
-    if token != settings.internal_admin_token:
-        return html_page("管理登录", "<div class=\"panel bad\">管理 Token 不正确</div>")
+def admin_login_post(username: str = Form(...), password: str = Form(...)) -> Response:
+    if username != settings.admin_username or password != settings.admin_password:
+        return html_page("管理登录", "<div class=\"panel bad\">账号或密码不正确</div>")
     response = RedirectResponse("/admin", status_code=303)
-    response.set_cookie("btf_admin", token, httponly=True, samesite="lax")
+    response.set_cookie("btf_admin", settings.internal_admin_token, httponly=True, samesite="lax")
     return response
 
 

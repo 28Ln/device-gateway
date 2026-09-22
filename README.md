@@ -36,7 +36,7 @@ python -m app.cli approve-order ORDER_ID
 - `/admin/orders` approve renewal orders
 - `/admin/usage` inspect device usage
 
-Admin login uses `INTERNAL_ADMIN_TOKEN`.
+Admin login uses `BTF_ADMIN_USERNAME` and `BTF_ADMIN_PASSWORD`. `INTERNAL_ADMIN_TOKEN` is still accepted through `x-admin-token` for internal scripts.
 
 ## Payment
 
