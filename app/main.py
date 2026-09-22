@@ -55,28 +55,139 @@ def html_page(title: str, body: str) -> HTMLResponse:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title}</title>
   <style>
-    body {{ margin: 0; font-family: Arial, sans-serif; background: #f6f8fb; color: #18202a; }}
-    header {{ background: #102033; color: white; padding: 18px 24px; }}
-    main {{ max-width: 960px; margin: 0 auto; padding: 24px; }}
-    nav {{ background: #102033; border-radius: 8px; padding: 12px; margin-bottom: 18px; }}
-    nav a {{ color: white; margin-right: 16px; text-decoration: none; }}
-    form, .panel {{ background: white; border: 1px solid #d9e0ea; border-radius: 8px; padding: 18px; margin: 16px 0; }}
-    input, select, button {{ font-size: 16px; padding: 10px; }}
-    input, select {{ width: 100%; box-sizing: border-box; margin: 8px 0 14px; border: 1px solid #c8d1dc; border-radius: 6px; }}
-    button {{ background: #0f6bff; border: 0; color: white; border-radius: 6px; cursor: pointer; }}
-    table {{ width: 100%; border-collapse: collapse; background: white; }}
-    th, td {{ text-align: left; border-bottom: 1px solid #e3e8ef; padding: 10px; }}
-    .muted {{ color: #687586; }}
-    .ok {{ color: #087443; }}
-    .bad {{ color: #b42318; }}
+    :root {{
+      --bg: #f7f8fa;
+      --surface: #ffffff;
+      --surface-muted: #f9fafb;
+      --border: #e5e7eb;
+      --text: #111827;
+      --muted: #6b7280;
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --ok: #059669;
+      --bad: #dc2626;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+    }}
+    header {{
+      height: 56px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }}
+    header img {{ width: 30px; height: 30px; border-radius: 8px; }}
+    header strong {{ font-size: 15px; font-weight: 650; }}
+    main {{ max-width: 1180px; margin: 0 auto; padding: 24px; }}
+    h1 {{ font-size: 24px; line-height: 1.25; margin: 0 0 18px; font-weight: 650; }}
+    h2 {{ font-size: 16px; margin: 0 0 14px; font-weight: 650; }}
+    nav {{
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px;
+      margin-bottom: 22px;
+      overflow-x: auto;
+    }}
+    nav a {{
+      color: #374151;
+      padding: 8px 12px;
+      border-radius: 6px;
+      text-decoration: none;
+      white-space: nowrap;
+    }}
+    nav a:hover {{ background: var(--surface-muted); color: var(--text); }}
+    form, .panel {{
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 18px;
+      margin: 16px 0;
+    }}
+    label {{ display: block; margin-bottom: 6px; color: #374151; font-weight: 500; }}
+    input, select, button, textarea {{
+      font: inherit;
+    }}
+    input, select {{
+      width: 100%;
+      padding: 9px 11px;
+      margin: 0 0 14px;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--text);
+    }}
+    input:focus, select:focus, textarea:focus {{
+      outline: 2px solid rgba(37, 99, 235, .18);
+      border-color: var(--primary);
+    }}
+    button {{
+      min-height: 36px;
+      padding: 8px 13px;
+      background: var(--primary);
+      border: 1px solid var(--primary);
+      color: white;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 500;
+    }}
+    button:hover {{ background: var(--primary-hover); border-color: var(--primary-hover); }}
+    table {{
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+    th, td {{ text-align: left; border-bottom: 1px solid var(--border); padding: 11px 12px; vertical-align: top; }}
+    th {{ background: var(--surface-muted); color: #4b5563; font-weight: 600; }}
+    tr:last-child td {{ border-bottom: 0; }}
+    .muted {{ color: var(--muted); }}
+    .ok {{ color: var(--ok); }}
+    .bad {{ color: var(--bad); }}
     .actions form {{ display: inline-block; padding: 0; border: 0; margin: 0 4px 4px 0; background: transparent; }}
-    .actions button {{ padding: 7px 10px; font-size: 14px; }}
-    textarea {{ width: 100%; min-height: 220px; box-sizing: border-box; }}
-    code {{ background: #eef2f7; padding: 2px 5px; border-radius: 4px; }}
+    .actions button {{ min-height: 30px; padding: 5px 9px; font-size: 13px; }}
+    textarea {{
+      width: 100%;
+      min-height: 220px;
+      padding: 10px;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }}
+    code {{ background: #f3f4f6; padding: 2px 5px; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }}
+    @media (max-width: 760px) {{
+      header {{ padding: 0 16px; }}
+      main {{ padding: 16px; }}
+      table {{ display: block; overflow-x: auto; }}
+    }}
   </style>
 </head>
 <body>
-  <header><strong>BTF API</strong> <span class="muted">Device AI Authorization</span></header>
+  <header>
+    <img src="/data/public/btf-iot-logo.svg" alt="">
+    <strong>BTF API</strong>
+    <span class="muted">Device AI Authorization</span>
+  </header>
   <main>{body}</main>
 </body>
 </html>"""
