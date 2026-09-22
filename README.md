@@ -26,8 +26,22 @@ python -m app.cli approve-order ORDER_ID
 ## Customer Pages
 
 - `/device` checks device authorization status.
-- `/device/pay` creates renewal orders.
+- `/device/pay` starts renewal flow.
 - `/api/device/status` returns JSON status for firmware or apps.
 
-Real payment provider callbacks can be added by marking orders paid and calling the same approval path.
+## Admin Pages
 
+- `/admin` dashboard
+- `/admin/devices` create, batch create, renew, disable, enable, rotate keys
+- `/admin/orders` approve renewal orders
+- `/admin/usage` inspect device usage
+
+Admin login uses `INTERNAL_ADMIN_TOKEN`.
+
+## Payment
+
+The current provider is manual confirmation. Devices create renewal orders from `/device`, and admins approve them in `/admin/orders`.
+
+Set `DEMO_PAYMENT_ENABLED=true` only in test environments to show a self-service test payment button that approves the order immediately.
+
+Real payment provider callbacks should validate the provider signature, then call the same order approval path.

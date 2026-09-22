@@ -10,6 +10,7 @@ services:
       NEW_API_TOKEN: ${NEW_API_TOKEN}
       INTERNAL_ADMIN_TOKEN: ${INTERNAL_ADMIN_TOKEN}
       PAYMENT_INSTRUCTIONS: ${PAYMENT_INSTRUCTIONS:-请联系销售确认付款，订单确认后设备授权会自动延期。}
+      DEMO_PAYMENT_ENABLED: ${DEMO_PAYMENT_ENABLED:-false}
     ports:
       - "80:8080"
     volumes:
@@ -20,4 +21,3 @@ services:
 networks:
   new-api-network:
     external: true
-

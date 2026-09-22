@@ -31,10 +31,10 @@ NEW_API_BASE_URL=http://new-api:3000
 NEW_API_TOKEN=$relay_token
 INTERNAL_ADMIN_TOKEN=$(openssl rand -hex 32)
 PAYMENT_INSTRUCTIONS=请联系销售确认付款，订单确认后设备授权会自动延期。
+DEMO_PAYMENT_ENABLED=false
 EOF
 fi
 
 docker compose build
 docker compose up -d
 docker compose exec -T btf-device-gateway python -m app.cli init-db
-

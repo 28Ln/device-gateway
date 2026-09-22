@@ -15,6 +15,7 @@ class Settings:
     new_api_token: str
     internal_admin_token: str
     payment_instructions: str
+    demo_payment_enabled: bool
 
 
 def load_settings() -> Settings:
@@ -31,5 +32,5 @@ def load_settings() -> Settings:
             "PAYMENT_INSTRUCTIONS",
             "请联系销售确认付款，订单确认后设备授权会自动延期。",
         ),
+        demo_payment_enabled=os.getenv("DEMO_PAYMENT_ENABLED", "false").lower() in {"1", "true", "yes", "on"},
     )
-

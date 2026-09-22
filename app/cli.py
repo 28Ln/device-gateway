@@ -7,13 +7,17 @@ from app.config import load_settings
 from app.service import (
     DeviceError,
     approve_order,
+    batch_create_devices,
     create_device,
     disable_device,
     enable_device,
     ensure_ready,
     get_device,
+    list_orders,
+    list_usage,
     list_devices,
     renew_device,
+    rotate_device_key,
 )
 
 
@@ -38,6 +42,18 @@ def cmd_create_device(args: argparse.Namespace) -> None:
     print(f"base_url={settings.public_base_url}/v1")
     print("model=deepseek-v4.1-flash")
     print(f"expires_at={fmt_ts(device['expires_at'])}")
+
+
+def cmd_batch_create(args: argparse.Namespace) -> None:
+    settings = load_settings()
+    ensure_ready(settings.database_path)
+    rows = batch_create_devices(settings.database_path, args.prefix, args.count, args.days, args.note)
+    print("device_id,api_key,base_url,model,expires_at")
+    for key, device in rows:
+        print(
+            f"{device['device_id']},{key},{settings.public_base_url}/v1,"
+            f"deepseek-v4.1-flash,{fmt_ts(device['expires_at'])}"
+        )
 
 
 def print_device(device: dict) -> None:
@@ -100,6 +116,53 @@ def cmd_approve_order(args: argparse.Namespace) -> None:
     print(f"status={order['status']}")
 
 
+def cmd_list_orders(args: argparse.Namespace) -> None:
+    settings = load_settings()
+    ensure_ready(settings.database_path)
+    for order in list_orders(settings.database_path, args.limit):
+        print(
+            "\t".join(
+                [
+                    order["id"],
+                    order["device_id"],
+                    order["plan_id"],
+                    order["status"],
+                    str(order["amount"]),
+                    order["currency"],
+                    fmt_ts(order["created_at"]),
+                ]
+            )
+        )
+
+
+def cmd_rotate_key(args: argparse.Namespace) -> None:
+    settings = load_settings()
+    ensure_ready(settings.database_path)
+    key, device = rotate_device_key(settings.database_path, args.device_id)
+    print(f"device_id={device['device_id']}")
+    print(f"api_key={key}")
+    print(f"base_url={settings.public_base_url}/v1")
+    print("model=deepseek-v4.1-flash")
+
+
+def cmd_list_usage(args: argparse.Namespace) -> None:
+    settings = load_settings()
+    ensure_ready(settings.database_path)
+    for event in list_usage(settings.database_path, args.device_id, args.limit):
+        print(
+            "\t".join(
+                [
+                    str(event["id"]),
+                    event["device_id"],
+                    event["path"],
+                    str(event["status_code"]),
+                    str(event["total_tokens"]),
+                    fmt_ts(event["created_at"]),
+                ]
+            )
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="btf-gateway")
     sub = parser.add_subparsers(required=True)
@@ -112,6 +175,13 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--days", type=int, default=30)
     create.add_argument("--note", default="")
     create.set_defaults(func=cmd_create_device)
+
+    batch = sub.add_parser("batch-create")
+    batch.add_argument("prefix")
+    batch.add_argument("--count", type=int, required=True)
+    batch.add_argument("--days", type=int, default=30)
+    batch.add_argument("--note", default="")
+    batch.set_defaults(func=cmd_batch_create)
 
     get = sub.add_parser("get-device")
     get.add_argument("device_id")
@@ -138,6 +208,19 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("order_id")
     approve.set_defaults(func=cmd_approve_order)
 
+    orders = sub.add_parser("list-orders")
+    orders.add_argument("--limit", type=int, default=200)
+    orders.set_defaults(func=cmd_list_orders)
+
+    rotate = sub.add_parser("rotate-key")
+    rotate.add_argument("device_id")
+    rotate.set_defaults(func=cmd_rotate_key)
+
+    usage = sub.add_parser("list-usage")
+    usage.add_argument("--device-id")
+    usage.add_argument("--limit", type=int, default=200)
+    usage.set_defaults(func=cmd_list_usage)
+
     return parser
 
 
@@ -152,4 +235,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

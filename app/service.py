@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import re
 from pathlib import Path
 
 from app.db import connect, init_db, now_ts
@@ -27,11 +28,20 @@ class InvalidState(DeviceError):
     pass
 
 
+DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+
+
+def validate_device_id(device_id: str) -> None:
+    if not DEVICE_ID_RE.match(device_id):
+        raise ValueError("device_id may only contain letters, numbers, dot, underscore, colon, or dash")
+
+
 def ensure_ready(database_path: Path) -> None:
     init_db(database_path)
 
 
 def create_device(database_path: Path, device_id: str, days: int, note: str = "") -> tuple[str, dict]:
+    validate_device_id(device_id)
     if days <= 0:
         raise ValueError("days must be greater than 0")
     key = generate_device_key()
@@ -68,6 +78,21 @@ def get_device(database_path: Path, device_id: str) -> dict:
     return dict(row)
 
 
+def get_device_by_key(database_path: Path, device_key: str) -> dict:
+    with connect(database_path) as conn:
+        row = conn.execute(
+            """
+            select *
+            from devices
+            where key_hash = ?
+            """,
+            (hash_key(device_key),),
+        ).fetchone()
+    if not row:
+        raise NotFound("invalid device key")
+    return dict(row)
+
+
 def list_devices(database_path: Path) -> list[dict]:
     with connect(database_path) as conn:
         rows = conn.execute(
@@ -76,28 +101,51 @@ def list_devices(database_path: Path) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def authenticate_device(database_path: Path, device_key: str) -> DeviceAuth:
-    with connect(database_path) as conn:
-        row = conn.execute(
-            """
-            select device_id, status, expires_at, request_count, total_tokens
-            from devices
-            where key_hash = ?
-            """,
-            (hash_key(device_key),),
-        ).fetchone()
-    if not row:
-        raise NotFound("invalid device key")
-    auth = DeviceAuth(
+def device_auth_from_row(row: dict) -> DeviceAuth:
+    return DeviceAuth(
         device_id=row["device_id"],
         status=row["status"],
         expires_at=row["expires_at"],
         request_count=row["request_count"],
         total_tokens=row["total_tokens"],
     )
+
+
+def authenticate_device(database_path: Path, device_key: str) -> DeviceAuth:
+    auth = device_auth_from_row(get_device_by_key(database_path, device_key))
     if not auth.is_active:
         raise InvalidState("device authorization expired or disabled")
     return auth
+
+
+def rotate_device_key(database_path: Path, device_id: str) -> tuple[str, dict]:
+    key = generate_device_key()
+    ts = now_ts()
+    with connect(database_path) as conn:
+        cur = conn.execute(
+            """
+            update devices
+            set key_hash = ?, key_mask = ?, updated_at = ?
+            where device_id = ?
+            """,
+            (hash_key(key), mask_key(key), ts, device_id),
+        )
+        if cur.rowcount == 0:
+            raise NotFound(f"device not found: {device_id}")
+    return key, get_device(database_path, device_id)
+
+
+def batch_create_devices(database_path: Path, prefix: str, count: int, days: int, note: str = "") -> list[tuple[str, dict]]:
+    if not DEVICE_ID_RE.match(f"{prefix}0001"):
+        raise ValueError("prefix would create invalid device ids")
+    if count <= 0:
+        raise ValueError("count must be greater than 0")
+    width = max(4, len(str(count)))
+    created: list[tuple[str, dict]] = []
+    for idx in range(1, count + 1):
+        device_id = f"{prefix}{idx:0{width}d}"
+        created.append(create_device(database_path, device_id, days, note))
+    return created
 
 
 def renew_device(database_path: Path, device_id: str, days: int) -> dict:
@@ -171,7 +219,7 @@ def plans(database_path: Path) -> list[dict]:
 
 
 def create_order(database_path: Path, device_key: str, plan_id: str) -> dict:
-    auth = authenticate_device(database_path, device_key)
+    device = get_device_by_key(database_path, device_key)
     ts = now_ts()
     with connect(database_path) as conn:
         plan = conn.execute(
@@ -188,7 +236,7 @@ def create_order(database_path: Path, device_key: str, plan_id: str) -> dict:
             """,
             (
                 order_id,
-                auth.device_id,
+                device["device_id"],
                 plan_id,
                 float(plan["price_amount"]),
                 plan["currency"],
@@ -197,6 +245,29 @@ def create_order(database_path: Path, device_key: str, plan_id: str) -> dict:
         )
         row = conn.execute("select * from orders where id = ?", (order_id,)).fetchone()
     return dict(row)
+
+
+def get_order(database_path: Path, order_id: str) -> dict:
+    with connect(database_path) as conn:
+        row = conn.execute("select * from orders where id = ?", (order_id,)).fetchone()
+    if not row:
+        raise NotFound(f"order not found: {order_id}")
+    return dict(row)
+
+
+def list_orders(database_path: Path, limit: int = 200) -> list[dict]:
+    with connect(database_path) as conn:
+        rows = conn.execute(
+            """
+            select o.*, p.title as plan_title
+            from orders o
+            left join plans p on p.id = o.plan_id
+            order by o.created_at desc
+            limit ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def approve_order(database_path: Path, order_id: str) -> dict:
@@ -245,6 +316,38 @@ def approve_order(database_path: Path, order_id: str) -> dict:
     return dict(updated)
 
 
+def approve_order_for_key(database_path: Path, order_id: str, device_key: str) -> dict:
+    device = get_device_by_key(database_path, device_key)
+    order = get_order(database_path, order_id)
+    if order["device_id"] != device["device_id"]:
+        raise InvalidState("order does not belong to this device")
+    return approve_order(database_path, order_id)
+
+
+def list_usage(database_path: Path, device_id: str | None = None, limit: int = 200) -> list[dict]:
+    with connect(database_path) as conn:
+        if device_id:
+            rows = conn.execute(
+                """
+                select * from usage_events
+                where device_id = ?
+                order by id desc
+                limit ?
+                """,
+                (device_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                select * from usage_events
+                order by id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def record_usage(
     database_path: Path,
     device_id: str,
@@ -278,4 +381,3 @@ def record_usage(
             """,
             (prompt_tokens, completion_tokens, total_tokens, ts, ts, device_id),
         )
-
