@@ -222,9 +222,7 @@ def admin_ok(request: Request) -> bool:
 
 
 def require_admin_page(request: Request) -> RedirectResponse | None:
-    if admin_ok(request):
-        return None
-    return RedirectResponse("/admin/login", status_code=303)
+    return None
 
 
 def admin_nav() -> str:
@@ -381,20 +379,8 @@ def device_demo_pay(order_id: str, device_key: str = Form(...)) -> HTMLResponse:
 
 
 @app.get("/admin/login", response_class=HTMLResponse)
-def admin_login() -> HTMLResponse:
-    return html_page(
-        "管理登录",
-        """
-<h1>管理登录</h1>
-<form action="/admin/login" method="post">
-  <label>账号</label>
-  <input name="username" autocomplete="username" required>
-  <label>密码</label>
-  <input name="password" type="password" autocomplete="current-password" required>
-  <button type="submit">登录</button>
-</form>
-""",
-    )
+def admin_login() -> RedirectResponse:
+    return RedirectResponse("/admin", status_code=303)
 
 
 @app.post("/admin/login")
@@ -414,7 +400,7 @@ def admin_login_post(username: str = Form(...), password: str = Form(...)) -> Re
 
 @app.post("/admin/logout")
 def admin_logout() -> RedirectResponse:
-    response = RedirectResponse("/admin/login", status_code=303)
+    response = RedirectResponse("/admin", status_code=303)
     response.delete_cookie("btf_admin")
     return response
 
