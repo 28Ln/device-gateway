@@ -14,6 +14,7 @@ pragma foreign_keys = on;
 create table if not exists devices (
   id integer primary key autoincrement,
   device_id text not null unique,
+  user_id integer,
   key_hash text not null unique,
   key_mask text not null,
   status text not null default 'active',
@@ -25,6 +26,17 @@ create table if not exists devices (
   prompt_tokens integer not null default 0,
   completion_tokens integer not null default 0,
   total_tokens integer not null default 0,
+  note text not null default ''
+);
+
+create table if not exists users (
+  id integer primary key autoincrement,
+  username text not null unique,
+  display_name text not null,
+  contact text not null default '',
+  status text not null default 'active',
+  created_at integer not null,
+  updated_at integer not null,
   note text not null default ''
 );
 
@@ -88,6 +100,12 @@ def connect(database_path: Path) -> Iterator[sqlite3.Connection]:
 def init_db(database_path: Path) -> None:
     with connect(database_path) as conn:
         conn.executescript(SCHEMA)
+        device_columns = {
+            row["name"]
+            for row in conn.execute("pragma table_info(devices)").fetchall()
+        }
+        if "user_id" not in device_columns:
+            conn.execute("alter table devices add column user_id integer")
         for plan in DEFAULT_PLANS:
             conn.execute(
                 """
@@ -106,4 +124,3 @@ def init_db(database_path: Path) -> None:
 
 def now_ts() -> int:
     return int(time.time())
-

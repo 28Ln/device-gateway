@@ -8,14 +8,19 @@ from app.service import (
     DeviceError,
     approve_order,
     batch_create_devices,
+    bind_device_user,
     create_device,
+    create_user,
     disable_device,
     enable_device,
     ensure_ready,
     get_device,
+    import_devices,
     list_orders,
     list_usage,
     list_devices,
+    list_users,
+    parse_optional_int,
     renew_device,
     rotate_device_key,
 )
@@ -33,10 +38,36 @@ def cmd_init_db(args: argparse.Namespace) -> None:
     print(f"database={settings.database_path}")
 
 
+def cmd_create_user(args: argparse.Namespace) -> None:
+    settings = load_settings()
+    ensure_ready(settings.database_path)
+    user = create_user(settings.database_path, args.username, args.display_name, args.contact, args.note)
+    print(f"user_id={user['id']}")
+    print(f"username={user['username']}")
+    print(f"display_name={user['display_name']}")
+
+
+def cmd_list_users(args: argparse.Namespace) -> None:
+    settings = load_settings()
+    ensure_ready(settings.database_path)
+    for user in list_users(settings.database_path):
+        print(
+            "\t".join(
+                [
+                    str(user["id"]),
+                    user["username"],
+                    user["display_name"],
+                    user["contact"],
+                    user["status"],
+                ]
+            )
+        )
+
+
 def cmd_create_device(args: argparse.Namespace) -> None:
     settings = load_settings()
     ensure_ready(settings.database_path)
-    key, device = create_device(settings.database_path, args.device_id, args.days, args.note)
+    key, device = create_device(settings.database_path, args.device_id, args.days, args.note, args.user_id)
     print(f"device_id={device['device_id']}")
     print(f"api_key={key}")
     print(f"base_url={settings.public_base_url}/v1")
@@ -47,7 +78,26 @@ def cmd_create_device(args: argparse.Namespace) -> None:
 def cmd_batch_create(args: argparse.Namespace) -> None:
     settings = load_settings()
     ensure_ready(settings.database_path)
-    rows = batch_create_devices(settings.database_path, args.prefix, args.count, args.days, args.note)
+    rows = batch_create_devices(settings.database_path, args.prefix, args.count, args.days, args.note, args.user_id)
+    print("device_id,api_key,base_url,model,expires_at")
+    for key, device in rows:
+        print(
+            f"{device['device_id']},{key},{settings.public_base_url}/v1,"
+            f"deepseek-v4.1-flash,{fmt_ts(device['expires_at'])}"
+        )
+
+
+def cmd_import_devices(args: argparse.Namespace) -> None:
+    settings = load_settings()
+    ensure_ready(settings.database_path)
+    if args.file == "-":
+        import sys
+
+        raw = sys.stdin.read()
+    else:
+        with open(args.file, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    rows = import_devices(settings.database_path, raw.splitlines(), args.days, args.note, args.user_id)
     print("device_id,api_key,base_url,model,expires_at")
     for key, device in rows:
         print(
@@ -58,6 +108,8 @@ def cmd_batch_create(args: argparse.Namespace) -> None:
 
 def print_device(device: dict) -> None:
     print(f"device_id={device['device_id']}")
+    print(f"user_id={device.get('user_id') or ''}")
+    print(f"owner={device.get('owner_display_name') or device.get('owner_username') or ''}")
     print(f"status={device['status']}")
     print(f"key={device['key_mask']}")
     print(f"expires_at={fmt_ts(device['expires_at'])}")
@@ -79,6 +131,8 @@ def cmd_list_devices(args: argparse.Namespace) -> None:
             "\t".join(
                 [
                     device["device_id"],
+                    str(device.get("user_id") or ""),
+                    device.get("owner_display_name") or device.get("owner_username") or "",
                     device["status"],
                     device["key_mask"],
                     fmt_ts(device["expires_at"]),
@@ -87,6 +141,12 @@ def cmd_list_devices(args: argparse.Namespace) -> None:
                 ]
             )
         )
+
+
+def cmd_bind_device(args: argparse.Namespace) -> None:
+    settings = load_settings()
+    ensure_ready(settings.database_path)
+    print_device(bind_device_user(settings.database_path, args.device_id, parse_optional_int(args.user_id)))
 
 
 def cmd_renew_device(args: argparse.Namespace) -> None:
@@ -170,10 +230,21 @@ def build_parser() -> argparse.ArgumentParser:
     init_db = sub.add_parser("init-db")
     init_db.set_defaults(func=cmd_init_db)
 
+    create_user_cmd = sub.add_parser("create-user")
+    create_user_cmd.add_argument("username")
+    create_user_cmd.add_argument("--display-name", required=True)
+    create_user_cmd.add_argument("--contact", default="")
+    create_user_cmd.add_argument("--note", default="")
+    create_user_cmd.set_defaults(func=cmd_create_user)
+
+    list_users_cmd = sub.add_parser("list-users")
+    list_users_cmd.set_defaults(func=cmd_list_users)
+
     create = sub.add_parser("create-device")
     create.add_argument("device_id")
     create.add_argument("--days", type=int, default=30)
     create.add_argument("--note", default="")
+    create.add_argument("--user-id", type=int)
     create.set_defaults(func=cmd_create_device)
 
     batch = sub.add_parser("batch-create")
@@ -181,7 +252,15 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("--count", type=int, required=True)
     batch.add_argument("--days", type=int, default=30)
     batch.add_argument("--note", default="")
+    batch.add_argument("--user-id", type=int)
     batch.set_defaults(func=cmd_batch_create)
+
+    import_cmd = sub.add_parser("import-devices")
+    import_cmd.add_argument("file", help="path to newline separated device ids, or - for stdin")
+    import_cmd.add_argument("--days", type=int, default=30)
+    import_cmd.add_argument("--note", default="")
+    import_cmd.add_argument("--user-id", type=int)
+    import_cmd.set_defaults(func=cmd_import_devices)
 
     get = sub.add_parser("get-device")
     get.add_argument("device_id")
@@ -189,6 +268,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_cmd = sub.add_parser("list-devices")
     list_cmd.set_defaults(func=cmd_list_devices)
+
+    bind = sub.add_parser("bind-device")
+    bind.add_argument("device_id")
+    bind.add_argument("--user-id", default="")
+    bind.set_defaults(func=cmd_bind_device)
 
     renew = sub.add_parser("renew-device")
     renew.add_argument("device_id")

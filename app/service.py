@@ -36,14 +36,71 @@ def validate_device_id(device_id: str) -> None:
         raise ValueError("device_id may only contain letters, numbers, dot, underscore, colon, or dash")
 
 
+def parse_optional_int(value: str | int | None) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
 def ensure_ready(database_path: Path) -> None:
     init_db(database_path)
 
 
-def create_device(database_path: Path, device_id: str, days: int, note: str = "") -> tuple[str, dict]:
+def create_user(database_path: Path, username: str, display_name: str, contact: str = "", note: str = "") -> dict:
+    username = username.strip()
+    display_name = display_name.strip() or username
+    if not username:
+        raise ValueError("username is required")
+    ts = now_ts()
+    with connect(database_path) as conn:
+        exists = conn.execute("select 1 from users where username = ?", (username,)).fetchone()
+        if exists:
+            raise Conflict(f"user already exists: {username}")
+        conn.execute(
+            """
+            insert into users (username, display_name, contact, status, created_at, updated_at, note)
+            values (?, ?, ?, 'active', ?, ?, ?)
+            """,
+            (username, display_name, contact, ts, ts, note),
+        )
+        row = conn.execute("select * from users where username = ?", (username,)).fetchone()
+    return dict(row)
+
+
+def get_user(database_path: Path, user_id: int) -> dict:
+    with connect(database_path) as conn:
+        row = conn.execute("select * from users where id = ?", (user_id,)).fetchone()
+    if not row:
+        raise NotFound(f"user not found: {user_id}")
+    return dict(row)
+
+
+def list_users(database_path: Path) -> list[dict]:
+    with connect(database_path) as conn:
+        rows = conn.execute("select * from users order by id desc").fetchall()
+    return [dict(row) for row in rows]
+
+
+def bind_device_user(database_path: Path, device_id: str, user_id: int | None) -> dict:
+    if user_id is not None:
+        get_user(database_path, user_id)
+    ts = now_ts()
+    with connect(database_path) as conn:
+        cur = conn.execute(
+            "update devices set user_id = ?, updated_at = ? where device_id = ?",
+            (user_id, ts, device_id),
+        )
+        if cur.rowcount == 0:
+            raise NotFound(f"device not found: {device_id}")
+    return get_device(database_path, device_id)
+
+
+def create_device(database_path: Path, device_id: str, days: int, note: str = "", user_id: int | None = None) -> tuple[str, dict]:
     validate_device_id(device_id)
     if days <= 0:
         raise ValueError("days must be greater than 0")
+    if user_id is not None:
+        get_user(database_path, user_id)
     key = generate_device_key()
     ts = now_ts()
     expires_at = ts + days * 86400
@@ -57,12 +114,12 @@ def create_device(database_path: Path, device_id: str, days: int, note: str = ""
         conn.execute(
             """
             insert into devices (
-              device_id, key_hash, key_mask, status, expires_at,
+              device_id, user_id, key_hash, key_mask, status, expires_at,
               created_at, updated_at, note
             )
-            values (?, ?, ?, 'active', ?, ?, ?, ?)
+            values (?, ?, ?, ?, 'active', ?, ?, ?, ?)
             """,
-            (device_id, hash_key(key), mask_key(key), expires_at, ts, ts, note),
+            (device_id, user_id, hash_key(key), mask_key(key), expires_at, ts, ts, note),
         )
     return key, get_device(database_path, device_id)
 
@@ -70,7 +127,12 @@ def create_device(database_path: Path, device_id: str, days: int, note: str = ""
 def get_device(database_path: Path, device_id: str) -> dict:
     with connect(database_path) as conn:
         row = conn.execute(
-            "select * from devices where device_id = ?",
+            """
+            select d.*, u.username as owner_username, u.display_name as owner_display_name
+            from devices d
+            left join users u on u.id = d.user_id
+            where d.device_id = ?
+            """,
             (device_id,),
         ).fetchone()
     if not row:
@@ -96,7 +158,12 @@ def get_device_by_key(database_path: Path, device_key: str) -> dict:
 def list_devices(database_path: Path) -> list[dict]:
     with connect(database_path) as conn:
         rows = conn.execute(
-            "select * from devices order by id desc",
+            """
+            select d.*, u.username as owner_username, u.display_name as owner_display_name
+            from devices d
+            left join users u on u.id = d.user_id
+            order by d.id desc
+            """,
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -135,16 +202,55 @@ def rotate_device_key(database_path: Path, device_id: str) -> tuple[str, dict]:
     return key, get_device(database_path, device_id)
 
 
-def batch_create_devices(database_path: Path, prefix: str, count: int, days: int, note: str = "") -> list[tuple[str, dict]]:
+def batch_create_devices(
+    database_path: Path,
+    prefix: str,
+    count: int,
+    days: int,
+    note: str = "",
+    user_id: int | None = None,
+) -> list[tuple[str, dict]]:
     if not DEVICE_ID_RE.match(f"{prefix}0001"):
         raise ValueError("prefix would create invalid device ids")
     if count <= 0:
         raise ValueError("count must be greater than 0")
+    if user_id is not None:
+        get_user(database_path, user_id)
     width = max(4, len(str(count)))
     created: list[tuple[str, dict]] = []
     for idx in range(1, count + 1):
         device_id = f"{prefix}{idx:0{width}d}"
-        created.append(create_device(database_path, device_id, days, note))
+        created.append(create_device(database_path, device_id, days, note, user_id))
+    return created
+
+
+def import_devices(
+    database_path: Path,
+    device_ids: list[str],
+    days: int,
+    note: str = "",
+    user_id: int | None = None,
+) -> list[tuple[str, dict]]:
+    if days <= 0:
+        raise ValueError("days must be greater than 0")
+    if user_id is not None:
+        get_user(database_path, user_id)
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw_id in device_ids:
+        device_id = raw_id.strip()
+        if not device_id:
+            continue
+        validate_device_id(device_id)
+        if device_id in seen:
+            continue
+        seen.add(device_id)
+        cleaned.append(device_id)
+    if not cleaned:
+        raise ValueError("no device ids provided")
+    created: list[tuple[str, dict]] = []
+    for device_id in cleaned:
+        created.append(create_device(database_path, device_id, days, note, user_id))
     return created
 
 

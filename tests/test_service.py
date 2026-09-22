@@ -10,11 +10,16 @@ from app.service import (
     approve_order,
     approve_order_for_key,
     authenticate_device,
+    bind_device_user,
     batch_create_devices,
     create_device,
+    create_user,
     create_order,
     disable_device,
     get_device_by_key,
+    import_devices,
+    list_devices,
+    list_users,
     renew_device,
     rotate_device_key,
 )
@@ -94,6 +99,39 @@ def test_batch_create_devices(tmp_path):
         "BTF-BATCH-0002",
         "BTF-BATCH-0003",
     ]
+
+
+def test_users_and_device_binding(tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+
+    user = create_user(db, "factory-a", "Factory A", "ops@example.com")
+    key, device = create_device(db, "BTF-USER-001", 30, user_id=user["id"])
+
+    assert list_users(db)[0]["username"] == "factory-a"
+    assert device["user_id"] == user["id"]
+    assert device["owner_display_name"] == "Factory A"
+    assert authenticate_device(db, key).device_id == "BTF-USER-001"
+
+    bind_device_user(db, "BTF-USER-001", None)
+    unbound = list_devices(db)[0]
+    assert unbound["user_id"] is None
+
+
+def test_import_devices_with_existing_identifiers(tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+
+    user = create_user(db, "dealer-a", "Dealer A")
+    rows = import_devices(
+        db,
+        ["SN-001", "SN-002", "SN-001", "", "IMEI:12345"],
+        30,
+        "imported",
+        user["id"],
+    )
+    assert [device["device_id"] for _, device in rows] == ["SN-001", "SN-002", "IMEI:12345"]
+    assert all(device["user_id"] == user["id"] for _, device in rows)
 
 
 def test_order_must_belong_to_device_key(tmp_path):

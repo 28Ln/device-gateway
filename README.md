@@ -32,11 +32,19 @@ python -m app.cli approve-order ORDER_ID
 ## Admin Pages
 
 - `/admin` dashboard
+- `/admin/users` create and inspect device owners
 - `/admin/devices` create, batch create, renew, disable, enable, rotate keys
 - `/admin/orders` approve renewal orders
 - `/admin/usage` inspect device usage
 
 Admin login uses `BTF_ADMIN_USERNAME` and `BTF_ADMIN_PASSWORD`. `INTERNAL_ADMIN_TOKEN` is still accepted through `x-admin-token` for internal scripts.
+
+## Users and Device Binding
+
+- `device_id` is the stable device identifier, such as SN, IMEI, MAC, or factory number.
+- `api_key` is a generated secret used for `/v1` calls. It should not be the same as `device_id`.
+- Devices can be bound to a user during single creation, prefix batch creation, or newline-based device identifier import.
+- Device keys can be rotated without changing the device identifier or user binding.
 
 ## Payment
 
