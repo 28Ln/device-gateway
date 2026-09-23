@@ -349,9 +349,15 @@ def plans(database_path: Path) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def create_order(database_path: Path, device_key: str, plan_id: str) -> dict:
+def create_order(
+    database_path: Path,
+    device_key: str,
+    plan_id: str,
+    expires_seconds: int = 86400,
+) -> dict:
     device = get_device_by_key(database_path, device_key)
     ts = now_ts()
+    payment_expires_at = ts + max(expires_seconds, 300)
     with connect(database_path) as conn:
         plan = conn.execute(
             "select * from plans where id = ? and enabled = 1",
@@ -362,8 +368,10 @@ def create_order(database_path: Path, device_key: str, plan_id: str) -> dict:
         order_id = f"btf_ord_{secrets.token_urlsafe(12)}"
         conn.execute(
             """
-            insert into orders (id, device_id, plan_id, status, amount, currency, created_at)
-            values (?, ?, ?, 'pending', ?, ?, ?)
+            insert into orders (
+              id, device_id, plan_id, status, amount, currency, created_at, payment_expires_at
+            )
+            values (?, ?, ?, 'pending', ?, ?, ?, ?)
             """,
             (
                 order_id,
@@ -372,6 +380,7 @@ def create_order(database_path: Path, device_key: str, plan_id: str) -> dict:
                 float(plan["price_amount"]),
                 plan["currency"],
                 ts,
+                payment_expires_at,
             ),
         )
         row = conn.execute("select * from orders where id = ?", (order_id,)).fetchone()
@@ -379,11 +388,56 @@ def create_order(database_path: Path, device_key: str, plan_id: str) -> dict:
 
 
 def get_order(database_path: Path, order_id: str) -> dict:
+    expire_pending_orders(database_path)
     with connect(database_path) as conn:
         row = conn.execute("select * from orders where id = ?", (order_id,)).fetchone()
     if not row:
         raise NotFound(f"order not found: {order_id}")
     return dict(row)
+
+
+def expire_pending_orders(database_path: Path) -> int:
+    ts = now_ts()
+    with connect(database_path) as conn:
+        cur = conn.execute(
+            """
+            update orders
+            set status = 'expired',
+                closed_at = ?,
+                close_reason = coalesce(close_reason, 'timeout')
+            where status = 'pending'
+              and payment_expires_at is not null
+              and payment_expires_at > 0
+              and payment_expires_at < ?
+            """,
+            (ts, ts),
+        )
+    return cur.rowcount
+
+
+def close_order(database_path: Path, order_id: str, reason: str = "manual") -> dict:
+    ts = now_ts()
+    reason = reason.strip() or "manual"
+    with connect(database_path) as conn:
+        order = conn.execute("select * from orders where id = ?", (order_id,)).fetchone()
+        if not order:
+            raise NotFound(f"order not found: {order_id}")
+        if order["status"] == "approved":
+            raise InvalidState("approved order cannot be closed")
+        if order["status"] in {"closed", "expired", "cancelled", "canceled"}:
+            return dict(order)
+        if order["status"] == "paid":
+            raise InvalidState("paid order cannot be closed before refund handling")
+        conn.execute(
+            """
+            update orders
+            set status = 'closed', closed_at = ?, close_reason = ?
+            where id = ?
+            """,
+            (ts, reason, order_id),
+        )
+        updated = conn.execute("select * from orders where id = ?", (order_id,)).fetchone()
+    return dict(updated)
 
 
 def save_payment_intent(
@@ -555,6 +609,7 @@ def list_orders(
     limit: int = 200,
     user_id: int | None = None,
 ) -> list[dict]:
+    expire_pending_orders(database_path)
     with connect(database_path) as conn:
         if user_id is None:
             rows = conn.execute(
@@ -584,6 +639,7 @@ def list_orders(
 
 
 def approve_order(database_path: Path, order_id: str) -> dict:
+    expire_pending_orders(database_path)
     ts = now_ts()
     with connect(database_path) as conn:
         order = conn.execute("select * from orders where id = ?", (order_id,)).fetchone()

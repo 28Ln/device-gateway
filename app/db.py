@@ -85,6 +85,8 @@ create table if not exists orders (
   created_at integer not null,
   paid_at integer,
   approved_at integer,
+  closed_at integer,
+  close_reason text,
   payment_provider text,
   provider_order_id text,
   payment_url text,
@@ -238,6 +240,8 @@ def init_db(database_path: Path) -> None:
             for row in conn.execute("pragma table_info(orders)").fetchall()
         }
         order_migrations = {
+            "closed_at": "integer",
+            "close_reason": "text",
             "payment_provider": "text",
             "provider_order_id": "text",
             "payment_url": "text",

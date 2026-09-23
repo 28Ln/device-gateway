@@ -12,12 +12,14 @@ from app.service import (
     authenticate_device,
     bind_device_user,
     batch_create_devices,
+    close_order,
     create_device,
     create_user,
     create_order,
     disable_device,
     get_device_by_key,
     import_devices,
+    list_orders,
     list_devices,
     list_users,
     renew_device,
@@ -144,3 +146,38 @@ def test_order_must_belong_to_device_key(tmp_path):
     order = create_order(db, key1, "month_1")
     with pytest.raises(InvalidState):
         approve_order_for_key(db, order["id"], key2)
+
+
+def test_order_can_be_closed_before_payment(tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+
+    key, _ = create_device(db, "BTF-ORDER-CLOSE", 1)
+    order = create_order(db, key, "month_1")
+    closed = close_order(db, order["id"], "customer_cancelled")
+
+    assert closed["status"] == "closed"
+    assert closed["closed_at"]
+    assert closed["close_reason"] == "customer_cancelled"
+    with pytest.raises(InvalidState):
+        approve_order(db, order["id"])
+
+
+def test_pending_order_expires_when_listed(tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+
+    key, _ = create_device(db, "BTF-ORDER-EXPIRE", 1)
+    order = create_order(db, key, "month_1", expires_seconds=300)
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute("update orders set payment_expires_at = ?", (int(time.time()) - 1,))
+    conn.commit()
+    conn.close()
+
+    listed = list_orders(db)
+    expired = next(item for item in listed if item["id"] == order["id"])
+    assert expired["status"] == "expired"
+    assert expired["closed_at"]
+    assert expired["close_reason"] == "timeout"

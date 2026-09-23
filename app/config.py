@@ -35,6 +35,7 @@ class Settings:
     chat_prompt_cost_per_million: float
     chat_completion_cost_per_million: float
     image_cost_per_request: float
+    order_expires_seconds: int
 
 
 def env_pem(name: str) -> str:
@@ -76,4 +77,5 @@ def load_settings() -> Settings:
         chat_prompt_cost_per_million=float(os.getenv("BTF_CHAT_PROMPT_COST_PER_MILLION", "0") or 0),
         chat_completion_cost_per_million=float(os.getenv("BTF_CHAT_COMPLETION_COST_PER_MILLION", "0") or 0),
         image_cost_per_request=float(os.getenv("BTF_IMAGE_COST_PER_REQUEST", "0") or 0),
+        order_expires_seconds=int(os.getenv("BTF_ORDER_EXPIRES_SECONDS", "86400") or 86400),
     )

@@ -21,6 +21,7 @@ from app.service import (
     approve_order,
     apply_payment_notification,
     authenticate_device,
+    close_order,
     create_order,
     ensure_ready,
     get_order,
@@ -1244,10 +1245,40 @@ async def api_create_device_order(
         if dashboard_user:
             device = get_device_by_key(settings.database_path, mac)
             require_owned_device(device, dashboard_user)
-        order = create_order(settings.database_path, mac, plan_id)
+        order = create_order(
+            settings.database_path,
+            mac,
+            plan_id,
+            settings.order_expires_seconds,
+        )
     except DeviceError as exc:
         return {"success": False, "message": str(exc)}
     return {"success": True, "message": "", "data": order}
+
+
+@app.post("/api/device/orders/{order_id}/close")
+async def api_close_device_order(
+    order_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    dashboard_user = await resolve_dashboard_user(request, authorization)
+    payload = await request.json()
+    reason = str(payload.get("reason") or "manual").strip() or "manual"
+    try:
+        order = get_order(settings.database_path, order_id)
+        if not dashboard_user.is_admin:
+            with connect(settings.database_path) as conn:
+                device = conn.execute(
+                    "select user_id from devices where device_id = ?",
+                    (order["device_id"],),
+                ).fetchone()
+            if not device or int(device["user_id"] or 0) != dashboard_user.id:
+                raise DeviceError("order does not belong to this user")
+        closed = close_order(settings.database_path, order_id, reason)
+    except DeviceError as exc:
+        return {"success": False, "message": str(exc)}
+    return {"success": True, "message": "", "data": closed}
 
 
 @app.post("/api/device/orders/approve")
