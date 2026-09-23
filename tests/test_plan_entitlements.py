@@ -217,6 +217,24 @@ def test_dashboard_user_can_bind_inventory_device(monkeypatch, tmp_path):
     assert row["bound_at"]
 
 
+def test_public_plan_list_hides_internal_limits(monkeypatch, tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+    use_test_database(monkeypatch, db)
+    client = TestClient(main.app)
+
+    response = client.get("/api/device/plans")
+
+    assert response.status_code == 200
+    item = response.json()["data"]["items"][0]
+    assert "token_limit" not in item
+    assert "rpm_limit" not in item
+    assert "chat_models" not in item
+    assert "image_models" not in item
+    assert "chat_alias" not in item
+    assert "image_alias" not in item
+
+
 def test_approved_order_updates_current_device_plan(tmp_path):
     db = tmp_path / "test.sqlite3"
     init_db(db)

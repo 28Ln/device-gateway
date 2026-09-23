@@ -919,9 +919,35 @@ async def api_manage_device(
     return {"success": True, "message": "", "data": {"updated": True}}
 
 
+def public_plan(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "title": row.get("title"),
+        "duration_days": row.get("duration_days"),
+        "price_amount": row.get("price_amount"),
+        "currency": row.get("currency"),
+        "sort_order": row.get("sort_order"),
+        "enabled": row.get("enabled"),
+        "allow_deepseek": row.get("allow_deepseek"),
+        "allow_image": row.get("allow_image"),
+    }
+
+
 @app.get("/api/device/plans")
-def api_list_device_plans() -> dict[str, Any]:
-    return {"success": True, "message": "", "data": {"items": plans(settings.database_path)}}
+async def api_list_device_plans(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    items = plans(settings.database_path)
+    dashboard_user = None
+    if authorization or request.headers.get("cookie"):
+        try:
+            dashboard_user = await resolve_dashboard_user(request, authorization)
+        except HTTPException:
+            dashboard_user = None
+    if not dashboard_user or not dashboard_user.is_admin:
+        items = [public_plan(item) for item in items]
+    return {"success": True, "message": "", "data": {"items": items}}
 
 
 @app.put("/api/device/plans/{plan_id}")
