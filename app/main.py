@@ -1032,6 +1032,7 @@ async def proxy_new_api(path: str, request: Request) -> Response:
     if request.method in {"GET", "HEAD"} and frontend_dist.exists():
         first = path.split("/", 1)[0]
         if first not in {"api", "v1", "health"}:
+            static_asset_roots = {"assets", "favicon.ico", "static"}
             if not path:
                 index_file = frontend_dist / "index.html"
                 if index_file.is_file():
@@ -1047,6 +1048,8 @@ async def proxy_new_api(path: str, request: Request) -> Response:
                     target_file,
                     headers={"Cache-Control": "no-store"},
                 )
+            if first in static_asset_roots:
+                raise HTTPException(status_code=404, detail="not found")
             index_file = frontend_dist / "index.html"
             if index_file.is_file():
                 return FileResponse(
