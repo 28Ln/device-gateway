@@ -32,6 +32,9 @@ class Settings:
     alipay_private_key: str
     alipay_public_key: str
     alipay_gateway: str
+    chat_prompt_cost_per_million: float
+    chat_completion_cost_per_million: float
+    image_cost_per_request: float
 
 
 def env_pem(name: str) -> str:
@@ -70,4 +73,7 @@ def load_settings() -> Settings:
         alipay_private_key=env_pem("ALIPAY_PRIVATE_KEY"),
         alipay_public_key=env_pem("ALIPAY_PUBLIC_KEY"),
         alipay_gateway=os.getenv("ALIPAY_GATEWAY", "https://openapi.alipay.com/gateway.do"),
+        chat_prompt_cost_per_million=float(os.getenv("BTF_CHAT_PROMPT_COST_PER_MILLION", "0") or 0),
+        chat_completion_cost_per_million=float(os.getenv("BTF_CHAT_COMPLETION_COST_PER_MILLION", "0") or 0),
+        image_cost_per_request=float(os.getenv("BTF_IMAGE_COST_PER_REQUEST", "0") or 0),
     )

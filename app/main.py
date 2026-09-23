@@ -66,6 +66,7 @@ DEFAULT_IMAGE_MODEL_TEXT = "[b]gpt-image-2"
 BTF_CHAT_ALIAS = "btf-chat"
 BTF_IMAGE_ALIAS = "btf-image"
 ACTIVE_REQUESTS: dict[str, int] = {}
+ACTIVE_USER_REQUESTS: dict[int, int] = {}
 
 
 @dataclass(frozen=True)
@@ -273,7 +274,10 @@ def plan_entitlements_for_device(device_id: str) -> dict[str, Any]:
     with connect(settings.database_path) as conn:
         row = conn.execute(
             """
-            select p.*, d.plan_started_at as device_plan_started_at
+            select p.*,
+                   d.user_id as device_user_id,
+                   d.plan_id as device_plan_id,
+                   d.plan_started_at as device_plan_started_at
             from devices d
             left join plans p on p.id = d.plan_id
             where d.device_id = ?
@@ -286,6 +290,22 @@ def plan_entitlements_for_device(device_id: str) -> dict[str, Any]:
     if not plan.get("id"):
         raise HTTPException(status_code=403, detail="device plan is not configured")
     return plan
+
+
+def user_limits_for_id(user_id: int) -> dict[str, Any] | None:
+    if user_id <= 0:
+        return None
+    with connect(settings.database_path) as conn:
+        row = conn.execute(
+            """
+            select id, request_limit, daily_request_limit, token_limit,
+                   daily_token_limit, rpm_limit, concurrency_limit
+            from users
+            where id = ? and status = 'active'
+            """,
+            (user_id,),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def allowed_models_for_plan(plan: dict[str, Any]) -> set[str]:
@@ -377,10 +397,74 @@ def usage_counters(device_id: str, plan_started_at: int, today_started_at: int) 
     }
 
 
+def user_usage_counters(user_id: int, today_started_at: int) -> dict[str, int]:
+    with connect(settings.database_path) as conn:
+        total = conn.execute(
+            """
+            select count(*) as requests,
+                   coalesce(sum(u.total_tokens), 0) as tokens
+            from usage_events u
+            join devices d on d.device_id = u.device_id
+            where coalesce(u.user_id, d.user_id) = ?
+            """,
+            (user_id,),
+        ).fetchone()
+        daily = conn.execute(
+            """
+            select count(*) as requests,
+                   coalesce(sum(u.total_tokens), 0) as tokens
+            from usage_events u
+            join devices d on d.device_id = u.device_id
+            where coalesce(u.user_id, d.user_id) = ? and u.created_at >= ?
+            """,
+            (user_id, today_started_at),
+        ).fetchone()
+        recent = conn.execute(
+            """
+            select count(*) as requests
+            from usage_events u
+            join devices d on d.device_id = u.device_id
+            where coalesce(u.user_id, d.user_id) = ? and u.created_at >= ?
+            """,
+            (user_id, now_ts() - 60),
+        ).fetchone()
+    return {
+        "requests": int(total["requests"] or 0),
+        "tokens": int(total["tokens"] or 0),
+        "daily_requests": int(daily["requests"] or 0),
+        "daily_tokens": int(daily["tokens"] or 0),
+        "rpm": int(recent["requests"] or 0),
+    }
+
+
+def enforce_user_limits(user_id: int | None, today_started_at: int) -> None:
+    if not user_id:
+        return
+    limits = user_limits_for_id(user_id)
+    if not limits:
+        return
+    counters = user_usage_counters(user_id, today_started_at)
+    checks = [
+        ("request_limit", "requests", "user request quota exceeded"),
+        ("daily_request_limit", "daily_requests", "user daily request quota exceeded"),
+        ("token_limit", "tokens", "user token quota exceeded"),
+        ("daily_token_limit", "daily_tokens", "user daily token quota exceeded"),
+        ("rpm_limit", "rpm", "user rate limit exceeded"),
+    ]
+    for limit_key, counter_key, message in checks:
+        limit = int_limit(limits, limit_key)
+        if limit and counters[counter_key] >= limit:
+            raise HTTPException(status_code=429 if limit_key == "rpm_limit" else 403, detail=message)
+    concurrency_limit = int_limit(limits, "concurrency_limit")
+    if concurrency_limit and ACTIVE_USER_REQUESTS.get(user_id, 0) >= concurrency_limit:
+        raise HTTPException(status_code=429, detail="user concurrency limit exceeded")
+
+
 def enforce_plan_limits(device_id: str, first: str, plan: dict[str, Any]) -> None:
     ts = now_ts()
+    today_started_at = day_start_ts(ts)
     plan_started_at = int(plan.get("device_plan_started_at") or ts)
-    counters = usage_counters(device_id, plan_started_at, day_start_ts(ts))
+    counters = usage_counters(device_id, plan_started_at, today_started_at)
     checks = [
         ("request_limit", "requests", "device plan request quota exceeded"),
         ("daily_request_limit", "daily_requests", "device daily request quota exceeded"),
@@ -403,6 +487,10 @@ def enforce_plan_limits(device_id: str, first: str, plan: dict[str, Any]) -> Non
     concurrency_limit = int_limit(plan, "concurrency_limit")
     if concurrency_limit and ACTIVE_REQUESTS.get(device_id, 0) >= concurrency_limit:
         raise HTTPException(status_code=429, detail="device concurrency limit exceeded")
+    enforce_user_limits(
+        int(plan.get("device_user_id") or 0) or None,
+        today_started_at,
+    )
 
 
 def enforce_plan_access(device_id: str, path: str, method: str, body: bytes) -> bytes:
@@ -1197,6 +1285,99 @@ async def api_list_device_usage(
     return {"success": True, "message": "", "data": {"items": items, "total": len(items)}}
 
 
+def user_usage_rows(user_id: int | None = None) -> list[dict[str, Any]]:
+    params: list[Any] = []
+    where = ""
+    if user_id is not None:
+        where = "where u.id = ?"
+        params.append(user_id)
+    today_started_at = day_start_ts(now_ts())
+    with connect(settings.database_path) as conn:
+        rows = conn.execute(
+            f"""
+            select u.id, u.username, u.display_name, u.status,
+                   u.request_limit, u.daily_request_limit,
+                   u.token_limit, u.daily_token_limit,
+                   u.rpm_limit, u.concurrency_limit,
+                   count(e.id) as request_count,
+                   coalesce(sum(e.total_tokens), 0) as total_tokens,
+                   coalesce(sum(e.estimated_cost), 0) as estimated_cost,
+                   coalesce(sum(case when e.created_at >= ? then 1 else 0 end), 0) as daily_request_count,
+                   coalesce(sum(case when e.created_at >= ? then e.total_tokens else 0 end), 0) as daily_tokens,
+                   coalesce(sum(case when e.created_at >= ? then e.estimated_cost else 0 end), 0) as daily_estimated_cost
+            from users u
+            left join usage_events e on e.user_id = u.id
+            {where}
+            group by u.id
+            order by total_tokens desc, request_count desc, u.id
+            """,
+            (today_started_at, today_started_at, today_started_at, *params),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/device/users/usage")
+async def api_list_device_user_usage(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    dashboard_user = await resolve_dashboard_user(request, authorization)
+    items = user_usage_rows(None if dashboard_user.is_admin else dashboard_user.id)
+    return {"success": True, "message": "", "data": {"items": items, "total": len(items)}}
+
+
+@app.put("/api/device/users/{user_id}/limits")
+async def api_update_device_user_limits(
+    user_id: int,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    dashboard_user = await resolve_dashboard_user(request, authorization)
+    require_admin(dashboard_user)
+    payload = await request.json()
+    fields = {
+        "request_limit": 0,
+        "daily_request_limit": 0,
+        "token_limit": 0,
+        "daily_token_limit": 0,
+        "rpm_limit": 0,
+        "concurrency_limit": 0,
+    }
+    with connect(settings.database_path) as conn:
+        row = conn.execute("select * from users where id = ?", (user_id,)).fetchone()
+        if not row:
+            return {"success": False, "message": "user not found"}
+        current = dict(row)
+        values = {
+            field: max(int(payload.get(field, current.get(field) or default) or 0), 0)
+            for field, default in fields.items()
+        }
+        conn.execute(
+            """
+            update users
+            set request_limit = ?,
+                daily_request_limit = ?,
+                token_limit = ?,
+                daily_token_limit = ?,
+                rpm_limit = ?,
+                concurrency_limit = ?,
+                updated_at = ?
+            where id = ?
+            """,
+            (
+                values["request_limit"],
+                values["daily_request_limit"],
+                values["token_limit"],
+                values["daily_token_limit"],
+                values["rpm_limit"],
+                values["concurrency_limit"],
+                now_ts(),
+                user_id,
+            ),
+        )
+    return {"success": True, "message": "", "data": user_usage_rows(user_id)[0]}
+
+
 @app.post("/api/device/payments/{provider_name}/notify")
 async def api_payment_notify(provider_name: str, request: Request) -> Response:
     body = await request.body()
@@ -1290,6 +1471,24 @@ def extract_usage(payload: bytes, content_type: str) -> tuple[int, int, int]:
     return prompt, completion, total
 
 
+def estimated_request_cost(
+    path: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    upstream_model: str,
+) -> float:
+    first = path.split("/", 1)[0]
+    if first == "images":
+        return float(settings.image_cost_per_request)
+    if upstream_model in DEEPSEEK_MODELS or first in {"chat", "completions", "responses"}:
+        return round(
+            (prompt_tokens / 1_000_000) * settings.chat_prompt_cost_per_million
+            + (completion_tokens / 1_000_000) * settings.chat_completion_cost_per_million,
+            8,
+        )
+    return 0.0
+
+
 def proxy_response_headers(headers: httpx.Headers) -> dict[str, str]:
     return {
         key: value
@@ -1330,12 +1529,19 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
         raise HTTPException(status_code=404, detail="not found")
     auth = authenticate_device(settings.database_path, bearer_token(authorization))
     body = await request.body()
+    requested_model = request_model_from_body(body)
     body = enforce_plan_access(auth.device_id, clean_path, request.method, body)
+    upstream_model = request_model_from_body(body)
+    plan = plan_entitlements_for_device(auth.device_id)
+    user_id = int(plan.get("device_user_id") or 0) or None
+    plan_id = str(plan.get("device_plan_id") or plan.get("id") or "")
     headers = upstream_proxy_headers(request)
     headers.pop("authorization", None)
     headers["authorization"] = f"Bearer {settings.new_api_token}"
     target = f"{settings.new_api_base_url}/v1/{clean_path}"
     ACTIVE_REQUESTS[auth.device_id] = ACTIVE_REQUESTS.get(auth.device_id, 0) + 1
+    if user_id:
+        ACTIVE_USER_REQUESTS[user_id] = ACTIVE_USER_REQUESTS.get(user_id, 0) + 1
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             upstream = await client.request(
@@ -1349,9 +1555,19 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
         ACTIVE_REQUESTS[auth.device_id] = max(ACTIVE_REQUESTS.get(auth.device_id, 1) - 1, 0)
         if ACTIVE_REQUESTS[auth.device_id] == 0:
             ACTIVE_REQUESTS.pop(auth.device_id, None)
+        if user_id:
+            ACTIVE_USER_REQUESTS[user_id] = max(ACTIVE_USER_REQUESTS.get(user_id, 1) - 1, 0)
+            if ACTIVE_USER_REQUESTS[user_id] == 0:
+                ACTIVE_USER_REQUESTS.pop(user_id, None)
     prompt, completion, total = extract_usage(
         upstream.content,
         upstream.headers.get("content-type", ""),
+    )
+    estimated_cost = estimated_request_cost(
+        clean_path,
+        prompt,
+        completion,
+        upstream_model,
     )
     record_usage(
         settings.database_path,
@@ -1361,6 +1577,11 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
         prompt,
         completion,
         total,
+        user_id,
+        plan_id,
+        requested_model,
+        upstream_model,
+        estimated_cost,
     )
     content = upstream.content
     if request.method == "GET" and clean_path == "models" and upstream.status_code == 200:

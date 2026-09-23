@@ -42,6 +42,12 @@ create table if not exists users (
   status text not null default 'active',
   created_at integer not null,
   updated_at integer not null,
+  request_limit integer not null default 0,
+  daily_request_limit integer not null default 0,
+  token_limit integer not null default 0,
+  daily_token_limit integer not null default 0,
+  rpm_limit integer not null default 0,
+  concurrency_limit integer not null default 0,
   note text not null default ''
 );
 
@@ -108,11 +114,16 @@ create table if not exists payment_transactions (
 create table if not exists usage_events (
   id integer primary key autoincrement,
   device_id text not null,
+  user_id integer,
+  plan_id text,
   path text not null,
   status_code integer not null,
+  requested_model text not null default '',
+  upstream_model text not null default '',
   prompt_tokens integer not null default 0,
   completion_tokens integer not null default 0,
   total_tokens integer not null default 0,
+  estimated_cost real not null default 0,
   created_at integer not null,
   foreign key(device_id) references devices(device_id)
 );
@@ -182,6 +193,21 @@ def init_db(database_path: Path) -> None:
             where plan_started_at is null
             """
         )
+        user_columns = {
+            row["name"]
+            for row in conn.execute("pragma table_info(users)").fetchall()
+        }
+        user_migrations = {
+            "request_limit": "integer not null default 0",
+            "daily_request_limit": "integer not null default 0",
+            "token_limit": "integer not null default 0",
+            "daily_token_limit": "integer not null default 0",
+            "rpm_limit": "integer not null default 0",
+            "concurrency_limit": "integer not null default 0",
+        }
+        for column, column_type in user_migrations.items():
+            if column not in user_columns:
+                conn.execute(f"alter table users add column {column} {column_type}")
         plan_columns = {
             row["name"]
             for row in conn.execute("pragma table_info(plans)").fetchall()
@@ -230,6 +256,40 @@ def init_db(database_path: Path) -> None:
             conn.execute(
                 "alter table payment_transactions add column provider_transaction_id text"
             )
+        usage_columns = {
+            row["name"]
+            for row in conn.execute("pragma table_info(usage_events)").fetchall()
+        }
+        usage_migrations = {
+            "user_id": "integer",
+            "plan_id": "text",
+            "requested_model": "text not null default ''",
+            "upstream_model": "text not null default ''",
+            "estimated_cost": "real not null default 0",
+        }
+        for column, column_type in usage_migrations.items():
+            if column not in usage_columns:
+                conn.execute(f"alter table usage_events add column {column} {column_type}")
+        conn.execute(
+            """
+            update usage_events
+            set user_id = (
+                    select user_id from devices
+                    where devices.device_id = usage_events.device_id
+                ),
+                plan_id = coalesce(plan_id, (
+                    select plan_id from devices
+                    where devices.device_id = usage_events.device_id
+                ))
+            where user_id is null or plan_id is null or plan_id = ''
+            """
+        )
+        conn.execute(
+            "create index if not exists idx_usage_user_created on usage_events(user_id, created_at)"
+        )
+        conn.execute(
+            "create index if not exists idx_usage_device_created on usage_events(device_id, created_at)"
+        )
         conn.execute(
             """
             create unique index if not exists idx_payment_idempotency

@@ -675,17 +675,37 @@ def record_usage(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     total_tokens: int = 0,
+    user_id: int | None = None,
+    plan_id: str = "",
+    requested_model: str = "",
+    upstream_model: str = "",
+    estimated_cost: float = 0,
 ) -> None:
     ts = now_ts()
     with connect(database_path) as conn:
         conn.execute(
             """
             insert into usage_events (
-              device_id, path, status_code, prompt_tokens, completion_tokens, total_tokens, created_at
+              device_id, user_id, plan_id, path, status_code,
+              requested_model, upstream_model,
+              prompt_tokens, completion_tokens, total_tokens, estimated_cost, created_at
             )
-            values (?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (device_id, path, status_code, prompt_tokens, completion_tokens, total_tokens, ts),
+            (
+                device_id,
+                user_id,
+                plan_id,
+                path,
+                status_code,
+                requested_model,
+                upstream_model,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                estimated_cost,
+                ts,
+            ),
         )
         conn.execute(
             """

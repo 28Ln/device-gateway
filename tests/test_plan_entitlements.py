@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.db import connect, init_db
-from app.service import create_device
+from app.service import create_device, create_user, record_usage
 from app.security import hash_key
 import app.main as main
 
@@ -178,6 +178,77 @@ def test_plan_rpm_limit_returns_429(monkeypatch, tmp_path):
             body("btf-chat"),
         )
     assert exc.value.status_code == 429
+
+
+def test_user_daily_limit_blocks_all_devices_for_user(monkeypatch, tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+    use_test_database(monkeypatch, db)
+    user = create_user(db, "heavy-user", "Heavy User")
+    create_device(db, "BTF:USER:LIMIT:1", 1, user_id=user["id"])
+    create_device(db, "BTF:USER:LIMIT:2", 1, user_id=user["id"])
+    with connect(db) as conn:
+        conn.execute(
+            "update users set daily_request_limit = 1 where id = ?",
+            (user["id"],),
+        )
+        conn.execute(
+            """
+            insert into usage_events (
+              device_id, user_id, path, status_code, prompt_tokens,
+              completion_tokens, total_tokens, created_at
+            )
+            values (?, ?, '/v1/chat/completions', 200, 0, 0, 0, ?)
+            """,
+            ("BTF:USER:LIMIT:1", user["id"], main.now_ts()),
+        )
+
+    with pytest.raises(HTTPException) as exc:
+        main.enforce_plan_access(
+            "BTF:USER:LIMIT:2",
+            "chat/completions",
+            "POST",
+            body("btf-chat"),
+        )
+    assert exc.value.status_code == 403
+    assert "user daily request" in exc.value.detail
+
+
+def test_record_usage_stores_attribution_fields(tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+    user = create_user(db, "usage-user", "Usage User")
+    create_device(db, "BTF:USAGE:ATTR", 1, user_id=user["id"])
+
+    record_usage(
+        db,
+        "BTF:USAGE:ATTR",
+        "/v1/chat/completions",
+        200,
+        10,
+        5,
+        15,
+        user["id"],
+        "day_1",
+        "btf-chat",
+        "deepseek-v4.1-flash",
+        0.1234,
+    )
+
+    with connect(db) as conn:
+        row = conn.execute(
+            """
+            select user_id, plan_id, requested_model, upstream_model, estimated_cost
+            from usage_events
+            where device_id = ?
+            """,
+            ("BTF:USAGE:ATTR",),
+        ).fetchone()
+    assert row["user_id"] == user["id"]
+    assert row["plan_id"] == "day_1"
+    assert row["requested_model"] == "btf-chat"
+    assert row["upstream_model"] == "deepseek-v4.1-flash"
+    assert row["estimated_cost"] == 0.1234
 
 
 def test_dashboard_user_can_bind_inventory_device(monkeypatch, tmp_path):
