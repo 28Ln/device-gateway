@@ -66,6 +66,14 @@ DEFAULT_IMAGE_MODELS = {
     "[b]gpt-image-2.5-flare",
     "[b]gpt-image-2.5-sunburst",
 }
+DEFAULT_IMAGE_MODEL_TEXT = ",".join(
+    [
+        "[b]gpt-image-2",
+        "[b]gpt-image-2.5",
+        "[b]gpt-image-2.5-flare",
+        "[b]gpt-image-2.5-sunburst",
+    ]
+)
 
 
 @dataclass(frozen=True)
@@ -649,6 +657,57 @@ async def api_manage_device(
 @app.get("/api/device/plans")
 def api_list_device_plans() -> dict[str, Any]:
     return {"success": True, "message": "", "data": {"items": plans(settings.database_path)}}
+
+
+@app.put("/api/device/plans/{plan_id}")
+async def api_update_device_plan(
+    plan_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    dashboard_user = await resolve_dashboard_user(request, authorization)
+    require_admin(dashboard_user)
+    payload = await request.json()
+    with connect(settings.database_path) as conn:
+        row = conn.execute("select * from plans where id = ?", (plan_id,)).fetchone()
+        if not row:
+            return {"success": False, "message": "plan not found"}
+        current = dict(row)
+        allow_deepseek = (
+            1 if payload.get("allow_deepseek") else 0
+            if "allow_deepseek" in payload
+            else int(current.get("allow_deepseek") or 0)
+        )
+        allow_image = (
+            1 if payload.get("allow_image") else 0
+            if "allow_image" in payload
+            else int(current.get("allow_image") or 0)
+        )
+        chat_models = str(
+            payload.get("chat_models")
+            if "chat_models" in payload
+            else current.get("chat_models") or "deepseek-v4.1-flash"
+        ).strip()
+        image_models = str(
+            payload.get("image_models")
+            if "image_models" in payload
+            else current.get("image_models") or ""
+        ).strip()
+        if allow_image and not image_models:
+            image_models = DEFAULT_IMAGE_MODEL_TEXT
+        conn.execute(
+            """
+            update plans
+            set allow_deepseek = ?,
+                allow_image = ?,
+                chat_models = ?,
+                image_models = ?
+            where id = ?
+            """,
+            (allow_deepseek, allow_image, chat_models, image_models, plan_id),
+        )
+        updated = conn.execute("select * from plans where id = ?", (plan_id,)).fetchone()
+    return {"success": True, "message": "", "data": dict(updated)}
 
 
 @app.get("/api/device/payment-providers")
