@@ -48,6 +48,16 @@ def ensure_ready(database_path: Path) -> None:
     init_db(database_path)
 
 
+def plan_id_for_days(days: int) -> str:
+    if days >= 30:
+        return "month_1"
+    if days >= 7:
+        return "week_1"
+    if days >= 3:
+        return "day_3"
+    return "day_1"
+
+
 def create_user(database_path: Path, username: str, display_name: str, contact: str = "", note: str = "") -> dict:
     username = username.strip()
     display_name = display_name.strip() or username
@@ -119,11 +129,21 @@ def create_device(database_path: Path, device_id: str, days: int, note: str = ""
             """
             insert into devices (
               device_id, user_id, key_hash, key_mask, status, expires_at,
-              created_at, updated_at, note
+              created_at, updated_at, note, plan_id
             )
-            values (?, ?, ?, ?, 'active', ?, ?, ?, ?)
+            values (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
             """,
-            (device_id, user_id, hash_key(key), key, expires_at, ts, ts, note),
+            (
+                device_id,
+                user_id,
+                hash_key(key),
+                key,
+                expires_at,
+                ts,
+                ts,
+                note,
+                plan_id_for_days(days),
+            ),
         )
     return key, get_device(database_path, device_id)
 
@@ -591,10 +611,10 @@ def approve_order(database_path: Path, order_id: str) -> dict:
         conn.execute(
             """
             update devices
-            set expires_at = ?, status = 'active', updated_at = ?
+            set expires_at = ?, status = 'active', updated_at = ?, plan_id = ?
             where device_id = ?
             """,
-            (expires_at, ts, order["device_id"]),
+            (expires_at, ts, order["plan_id"], order["device_id"]),
         )
         conn.execute(
             """

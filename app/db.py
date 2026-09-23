@@ -26,6 +26,7 @@ create table if not exists devices (
   prompt_tokens integer not null default 0,
   completion_tokens integer not null default 0,
   total_tokens integer not null default 0,
+  plan_id text,
   note text not null default ''
 );
 
@@ -47,7 +48,11 @@ create table if not exists plans (
   price_amount real not null,
   currency text not null default 'CNY',
   sort_order integer not null default 0,
-  enabled integer not null default 1
+  enabled integer not null default 1,
+  allow_deepseek integer not null default 1,
+  allow_image integer not null default 0,
+  chat_models text not null default 'deepseek-v4.1-flash',
+  image_models text not null default ''
 );
 
 create table if not exists orders (
@@ -101,11 +106,21 @@ create table if not exists usage_events (
 
 
 DEFAULT_PLANS = [
-    ("trial_1h", "1小时体验", 0, 1.99, "CNY", 10),
-    ("day_1", "1天通行", 1, 9.99, "CNY", 20),
-    ("week_1", "7天周卡", 7, 39.99, "CNY", 30),
-    ("month_1", "30天月卡", 30, 99.99, "CNY", 40),
+    ("trial_1h", "1小时体验", 0, 1.99, "CNY", 10, 1, 0),
+    ("day_1", "1天通行", 1, 9.99, "CNY", 20, 1, 0),
+    ("day_3", "3天通行", 3, 19.99, "CNY", 25, 1, 0),
+    ("week_1", "7天周卡", 7, 39.99, "CNY", 30, 1, 0),
+    ("month_1", "30天月卡", 30, 99.99, "CNY", 40, 1, 1),
 ]
+
+DEFAULT_IMAGE_MODELS = ",".join(
+    [
+        "[b]gpt-image-2",
+        "[b]gpt-image-2.5",
+        "[b]gpt-image-2.5-flare",
+        "[b]gpt-image-2.5-sunburst",
+    ]
+)
 
 
 @contextmanager
@@ -128,6 +143,37 @@ def init_db(database_path: Path) -> None:
         }
         if "user_id" not in device_columns:
             conn.execute("alter table devices add column user_id integer")
+        if "plan_id" not in device_columns:
+            conn.execute("alter table devices add column plan_id text")
+            conn.execute(
+                """
+                update devices
+                set plan_id = case
+                  when note like '%30天%' then 'month_1'
+                  when note like '%7天%' then 'week_1'
+                  when note like '%3天%' then 'day_3'
+                  when note like '%1天%' then 'day_1'
+                  when note like '%1小时%' then 'trial_1h'
+                  else 'day_1'
+                end
+                where plan_id is null or plan_id = ''
+                """
+            )
+        plan_columns = {
+            row["name"]
+            for row in conn.execute("pragma table_info(plans)").fetchall()
+        }
+        added_plan_entitlements = False
+        plan_migrations = {
+            "allow_deepseek": "integer not null default 1",
+            "allow_image": "integer not null default 0",
+            "chat_models": "text not null default 'deepseek-v4.1-flash'",
+            "image_models": "text not null default ''",
+        }
+        for column, column_type in plan_migrations.items():
+            if column not in plan_columns:
+                conn.execute(f"alter table plans add column {column} {column_type}")
+                added_plan_entitlements = True
         order_columns = {
             row["name"]
             for row in conn.execute("pragma table_info(orders)").fetchall()
@@ -161,8 +207,11 @@ def init_db(database_path: Path) -> None:
         for plan in DEFAULT_PLANS:
             conn.execute(
                 """
-                insert into plans (id, title, duration_days, price_amount, currency, sort_order)
-                values (?, ?, ?, ?, ?, ?)
+                insert into plans (
+                  id, title, duration_days, price_amount, currency, sort_order,
+                  allow_deepseek, allow_image, chat_models, image_models
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, 'deepseek-v4.1-flash', ?)
                 on conflict(id) do update set
                   title = excluded.title,
                   duration_days = excluded.duration_days,
@@ -170,8 +219,43 @@ def init_db(database_path: Path) -> None:
                   currency = excluded.currency,
                   sort_order = excluded.sort_order
                 """,
-                plan,
+                (*plan, DEFAULT_IMAGE_MODELS if plan[7] else ""),
             )
+        if added_plan_entitlements:
+            for plan in DEFAULT_PLANS:
+                conn.execute(
+                    """
+                    update plans
+                    set allow_deepseek = ?,
+                        allow_image = ?,
+                        chat_models = 'deepseek-v4.1-flash',
+                        image_models = ?
+                    where id = ?
+                    """,
+                    (plan[6], plan[7], DEFAULT_IMAGE_MODELS if plan[7] else "", plan[0]),
+                )
+            conn.execute(
+                """
+                update plans
+                set image_models = ?
+                where allow_image = 1 and (image_models is null or image_models = '')
+                """,
+                (DEFAULT_IMAGE_MODELS,),
+            )
+        conn.execute(
+            """
+            update devices
+            set plan_id = case
+              when note like '%30天%' then 'month_1'
+              when note like '%7天%' then 'week_1'
+              when note like '%3天%' then 'day_3'
+              when note like '%1天%' then 'day_1'
+              when note like '%1小时%' then 'trial_1h'
+              else 'day_1'
+            end
+            where plan_id is null or plan_id = ''
+            """
+        )
 
 
 def now_ts() -> int:

@@ -59,6 +59,13 @@ OPENAI_V1_PREFIXES = {
     "responses",
 }
 SAFE_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._~:-]+$")
+DEEPSEEK_MODELS = {"deepseek-v4.1-flash"}
+DEFAULT_IMAGE_MODELS = {
+    "[b]gpt-image-2",
+    "[b]gpt-image-2.5",
+    "[b]gpt-image-2.5-flare",
+    "[b]gpt-image-2.5-sunburst",
+}
 
 
 @dataclass(frozen=True)
@@ -199,6 +206,127 @@ def require_owned_device(device: dict[str, Any], user: DashboardUser) -> None:
         raise HTTPException(status_code=403, detail="device does not belong to this user")
 
 
+def split_model_list(value: Any) -> set[str]:
+    return {
+        item.strip()
+        for item in str(value or "").replace("\n", ",").split(",")
+        if item.strip()
+    }
+
+
+def request_model_from_body(body: bytes) -> str:
+    if not body:
+        return ""
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return ""
+    return str(payload.get("model") or "").strip()
+
+
+def plan_id_from_text(value: str) -> str:
+    normalized = value.strip().lower()
+    mapping = {
+        "trial_1h": "trial_1h",
+        "1小时体验": "trial_1h",
+        "day_1": "day_1",
+        "1天通行": "day_1",
+        "1天套餐": "day_1",
+        "day_3": "day_3",
+        "3天通行": "day_3",
+        "3天套餐": "day_3",
+        "week_1": "week_1",
+        "7天周卡": "week_1",
+        "7天套餐": "week_1",
+        "month_1": "month_1",
+        "30天月卡": "month_1",
+        "30天套餐": "month_1",
+    }
+    if normalized in mapping:
+        return mapping[normalized]
+    for needle, plan_id in (
+        ("30天", "month_1"),
+        ("7天", "week_1"),
+        ("3天", "day_3"),
+        ("1天", "day_1"),
+        ("1小时", "trial_1h"),
+    ):
+        if needle in value:
+            return plan_id
+    return normalized if normalized else "day_1"
+
+
+def plan_entitlements_for_device(device_id: str) -> dict[str, Any]:
+    with connect(settings.database_path) as conn:
+        row = conn.execute(
+            """
+            select p.*
+            from devices d
+            left join plans p on p.id = d.plan_id
+            where d.device_id = ?
+            """,
+            (device_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=403, detail="device plan is not configured")
+    plan = dict(row)
+    if not plan.get("id"):
+        raise HTTPException(status_code=403, detail="device plan is not configured")
+    return plan
+
+
+def allowed_models_for_plan(plan: dict[str, Any]) -> set[str]:
+    allowed: set[str] = set()
+    if int(plan.get("allow_deepseek") or 0):
+        allowed.update(split_model_list(plan.get("chat_models")) or DEEPSEEK_MODELS)
+    if int(plan.get("allow_image") or 0):
+        allowed.update(split_model_list(plan.get("image_models")) or DEFAULT_IMAGE_MODELS)
+    return allowed
+
+
+def enforce_plan_access(device_id: str, path: str, method: str, body: bytes) -> None:
+    if method == "OPTIONS":
+        return
+    plan = plan_entitlements_for_device(device_id)
+    first = path.split("/", 1)[0]
+    if first == "models":
+        return
+    model = request_model_from_body(body)
+    if not model:
+        raise HTTPException(status_code=400, detail="model is required")
+    if first == "images":
+        if not int(plan.get("allow_image") or 0):
+            raise HTTPException(status_code=403, detail="current device plan does not include GPT image generation")
+        if model not in (split_model_list(plan.get("image_models")) or DEFAULT_IMAGE_MODELS):
+            raise HTTPException(status_code=403, detail="image model is not included in current device plan")
+        return
+    if first in {"chat", "completions", "responses"}:
+        if not int(plan.get("allow_deepseek") or 0):
+            raise HTTPException(status_code=403, detail="current device plan does not include DeepSeek")
+        if model not in (split_model_list(plan.get("chat_models")) or DEEPSEEK_MODELS):
+            raise HTTPException(status_code=403, detail="chat model is not included in current device plan")
+        return
+    if model not in allowed_models_for_plan(plan):
+        raise HTTPException(status_code=403, detail="model is not included in current device plan")
+
+
+def filter_models_response(content: bytes, content_type: str, device_id: str) -> bytes:
+    if "application/json" not in content_type.lower():
+        return content
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except Exception:
+        return content
+    if not isinstance(payload.get("data"), list):
+        return content
+    allowed = allowed_models_for_plan(plan_entitlements_for_device(device_id))
+    payload["data"] = [
+        item for item in payload["data"]
+        if str(item.get("id") or "") in allowed
+    ]
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"ok": True, "service": "btf-device-gateway"}
@@ -260,7 +388,10 @@ def device_row_to_new_api(row: dict[str, Any]) -> dict[str, Any]:
         "username": row.get("owner_display_name") or row.get("owner_username") or "",
         "mac": row["device_id"],
         "name": name,
-        "plan": plan,
+        "plan": row.get("plan_title") or plan,
+        "plan_id": row.get("plan_id") or "",
+        "allow_deepseek": bool(row.get("allow_deepseek") or 0),
+        "allow_image": bool(row.get("allow_image") or 0),
         "status": row["status"],
         "expires_at": row["expires_at"],
         "last_seen_at": row.get("last_seen_at") or 0,
@@ -304,9 +435,11 @@ async def api_list_devices(
         where.append("d.user_id = ?")
         params.append(dashboard_user.id)
     query = """
-        select d.*, u.username as owner_username, u.display_name as owner_display_name
+        select d.*, u.username as owner_username, u.display_name as owner_display_name,
+               p.title as plan_title, p.allow_deepseek, p.allow_image
         from devices d
         left join users u on u.id = d.user_id
+        left join plans p on p.id = d.plan_id
     """
     if where:
         query += " where " + " and ".join(where)
@@ -355,6 +488,7 @@ async def api_create_device(
     mac = normalize_mac(payload.get("mac"))
     expires_at = int(payload.get("expires_at") or 0)
     status = str(payload.get("status") or "active").strip() or "active"
+    plan_id = plan_id_from_text(str(payload.get("plan_id") or payload.get("plan") or "day_1"))
     if not user_id or not mac or not expires_at:
         return {"success": False, "message": "invalid params"}
     if status not in {"active", "disabled"}:
@@ -369,16 +503,19 @@ async def api_create_device(
         user = conn.execute("select id from users where id = ?", (user_id,)).fetchone()
         if not user:
             return {"success": False, "message": "user not found"}
+        plan = conn.execute("select id from plans where id = ? and enabled = 1", (plan_id,)).fetchone()
+        if not plan:
+            return {"success": False, "message": "plan not found"}
         try:
             conn.execute(
                 """
                 insert into devices (
                   device_id, user_id, key_hash, key_mask, status, expires_at,
-                  created_at, updated_at, note
+                  created_at, updated_at, note, plan_id
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (mac, user_id, hash_key(mac), mac, status, expires_at, ts, ts, note),
+                (mac, user_id, hash_key(mac), mac, status, expires_at, ts, ts, note, plan_id),
             )
         except Exception as exc:
             return {"success": False, "message": str(exc)}
@@ -398,6 +535,7 @@ async def api_update_device(
     mac = normalize_mac(payload.get("mac"))
     expires_at = int(payload.get("expires_at") or 0)
     status = str(payload.get("status") or "active").strip() or "active"
+    plan_id = plan_id_from_text(str(payload.get("plan_id") or payload.get("plan") or "day_1"))
     if not device_id or not user_id or not mac or not expires_at:
         return {"success": False, "message": "invalid params"}
     if status not in {"active", "disabled"}:
@@ -412,6 +550,9 @@ async def api_update_device(
         user = conn.execute("select id from users where id = ?", (user_id,)).fetchone()
         if not user:
             return {"success": False, "message": "user not found"}
+        plan = conn.execute("select id from plans where id = ? and enabled = 1", (plan_id,)).fetchone()
+        if not plan:
+            return {"success": False, "message": "plan not found"}
         row = conn.execute("select id from devices where id = ?", (device_id,)).fetchone()
         if not row:
             return {"success": False, "message": "device not found"}
@@ -420,10 +561,10 @@ async def api_update_device(
                 """
                 update devices
                 set device_id = ?, user_id = ?, key_hash = ?, key_mask = ?,
-                    status = ?, expires_at = ?, updated_at = ?, note = ?
+                    status = ?, expires_at = ?, updated_at = ?, note = ?, plan_id = ?
                 where id = ?
                 """,
-                (mac, user_id, hash_key(mac), mac, status, expires_at, ts, note, device_id),
+                (mac, user_id, hash_key(mac), mac, status, expires_at, ts, note, plan_id, device_id),
             )
         except Exception as exc:
             return {"success": False, "message": str(exc)}
@@ -442,6 +583,7 @@ async def api_batch_create_devices(
     macs = split_macs(payload.get("macs"))
     expires_at = int(payload.get("expires_at") or 0)
     plan = str(payload.get("plan") or "")
+    plan_id = plan_id_from_text(str(payload.get("plan_id") or plan or "day_1"))
     remark = str(payload.get("remark") or "")
     if not user_id or not macs or not expires_at:
         return {"success": False, "message": "invalid params"}
@@ -452,6 +594,9 @@ async def api_batch_create_devices(
         user = conn.execute("select id from users where id = ?", (user_id,)).fetchone()
         if not user:
             return {"success": False, "message": "user not found"}
+        plan_row = conn.execute("select id from plans where id = ? and enabled = 1", (plan_id,)).fetchone()
+        if not plan_row:
+            return {"success": False, "message": "plan not found"}
         for mac in macs:
             note = compose_note(mac, plan, remark)
             try:
@@ -459,11 +604,11 @@ async def api_batch_create_devices(
                     """
                     insert into devices (
                       device_id, user_id, key_hash, key_mask, status, expires_at,
-                      created_at, updated_at, note
+                      created_at, updated_at, note, plan_id
                     )
-                    values (?, ?, ?, ?, 'active', ?, ?, ?, ?)
+                    values (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
                     """,
-                    (mac, user_id, hash_key(mac), mac, expires_at, ts, ts, note),
+                    (mac, user_id, hash_key(mac), mac, expires_at, ts, ts, note, plan_id),
                 )
                 created += 1
             except Exception:
@@ -724,9 +869,11 @@ async def api_get_device(
     with connect(settings.database_path) as conn:
         row = conn.execute(
             """
-            select d.*, u.username as owner_username, u.display_name as owner_display_name
+            select d.*, u.username as owner_username, u.display_name as owner_display_name,
+                   p.title as plan_title, p.allow_deepseek, p.allow_image
             from devices d
             left join users u on u.id = d.user_id
+            left join plans p on p.id = d.plan_id
             where d.id = ?
             """,
             (device_id,),
@@ -792,6 +939,7 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
         raise HTTPException(status_code=404, detail="not found")
     auth = authenticate_device(settings.database_path, bearer_token(authorization))
     body = await request.body()
+    enforce_plan_access(auth.device_id, clean_path, request.method, body)
     headers = upstream_proxy_headers(request)
     headers.pop("authorization", None)
     headers["authorization"] = f"Bearer {settings.new_api_token}"
@@ -817,8 +965,15 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
         completion,
         total,
     )
+    content = upstream.content
+    if request.method == "GET" and clean_path == "models" and upstream.status_code == 200:
+        content = filter_models_response(
+            upstream.content,
+            upstream.headers.get("content-type", ""),
+            auth.device_id,
+        )
     return Response(
-        content=upstream.content,
+        content=content,
         status_code=upstream.status_code,
         headers=proxy_response_headers(upstream.headers),
         media_type=upstream.headers.get("content-type"),
