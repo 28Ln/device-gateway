@@ -113,14 +113,7 @@ DEFAULT_PLANS = [
     ("month_1", "30天月卡", 30, 99.99, "CNY", 40, 1, 1),
 ]
 
-DEFAULT_IMAGE_MODELS = ",".join(
-    [
-        "[b]gpt-image-2",
-        "[b]gpt-image-2.5",
-        "[b]gpt-image-2.5-flare",
-        "[b]gpt-image-2.5-sunburst",
-    ]
-)
+DEFAULT_IMAGE_MODELS = "[b]gpt-image-2"
 
 
 @contextmanager

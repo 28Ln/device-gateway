@@ -60,20 +60,8 @@ OPENAI_V1_PREFIXES = {
 }
 SAFE_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._~:-]+$")
 DEEPSEEK_MODELS = {"deepseek-v4.1-flash"}
-DEFAULT_IMAGE_MODELS = {
-    "[b]gpt-image-2",
-    "[b]gpt-image-2.5",
-    "[b]gpt-image-2.5-flare",
-    "[b]gpt-image-2.5-sunburst",
-}
-DEFAULT_IMAGE_MODEL_TEXT = ",".join(
-    [
-        "[b]gpt-image-2",
-        "[b]gpt-image-2.5",
-        "[b]gpt-image-2.5-flare",
-        "[b]gpt-image-2.5-sunburst",
-    ]
-)
+DEFAULT_IMAGE_MODELS = {"[b]gpt-image-2"}
+DEFAULT_IMAGE_MODEL_TEXT = "[b]gpt-image-2"
 
 
 @dataclass(frozen=True)
