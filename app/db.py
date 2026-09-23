@@ -27,6 +27,10 @@ create table if not exists devices (
   completion_tokens integer not null default 0,
   total_tokens integer not null default 0,
   plan_id text,
+  plan_started_at integer,
+  bind_code_hash text,
+  bind_code_mask text,
+  bound_at integer,
   note text not null default ''
 );
 
@@ -52,7 +56,17 @@ create table if not exists plans (
   allow_deepseek integer not null default 1,
   allow_image integer not null default 0,
   chat_models text not null default 'deepseek-v4.1-flash',
-  image_models text not null default ''
+  image_models text not null default '',
+  token_limit integer not null default 0,
+  daily_token_limit integer not null default 0,
+  request_limit integer not null default 0,
+  daily_request_limit integer not null default 0,
+  image_limit integer not null default 0,
+  daily_image_limit integer not null default 0,
+  rpm_limit integer not null default 0,
+  concurrency_limit integer not null default 0,
+  chat_alias text not null default 'btf-chat',
+  image_alias text not null default 'btf-image'
 );
 
 create table if not exists orders (
@@ -106,11 +120,11 @@ create table if not exists usage_events (
 
 
 DEFAULT_PLANS = [
-    ("trial_1h", "1小时体验", 0, 1.99, "CNY", 10, 1, 0),
-    ("day_1", "1天通行", 1, 9.99, "CNY", 20, 1, 0),
-    ("day_3", "3天通行", 3, 19.99, "CNY", 25, 1, 0),
-    ("week_1", "7天周卡", 7, 39.99, "CNY", 30, 1, 0),
-    ("month_1", "30天月卡", 30, 99.99, "CNY", 40, 1, 1),
+    ("trial_1h", "1小时体验", 0, 1.99, "CNY", 10, 1, 0, 10_000, 10_000, 100, 100, 0, 0, 10, 1),
+    ("day_1", "1天通行", 1, 9.99, "CNY", 20, 1, 0, 100_000, 100_000, 1_000, 1_000, 0, 0, 30, 1),
+    ("day_3", "3天通行", 3, 19.99, "CNY", 25, 1, 0, 300_000, 120_000, 3_000, 1_200, 0, 0, 40, 1),
+    ("week_1", "7天周卡", 7, 39.99, "CNY", 30, 1, 0, 800_000, 150_000, 8_000, 1_500, 0, 0, 50, 2),
+    ("month_1", "30天月卡", 30, 99.99, "CNY", 40, 1, 1, 3_000_000, 200_000, 30_000, 2_000, 100, 10, 60, 2),
 ]
 
 DEFAULT_IMAGE_MODELS = "[b]gpt-image-2"
@@ -152,6 +166,22 @@ def init_db(database_path: Path) -> None:
                 where plan_id is null or plan_id = ''
                 """
             )
+        device_migrations = {
+            "plan_started_at": "integer",
+            "bind_code_hash": "text",
+            "bind_code_mask": "text",
+            "bound_at": "integer",
+        }
+        for column, column_type in device_migrations.items():
+            if column not in device_columns:
+                conn.execute(f"alter table devices add column {column} {column_type}")
+        conn.execute(
+            """
+            update devices
+            set plan_started_at = coalesce(plan_started_at, created_at)
+            where plan_started_at is null
+            """
+        )
         plan_columns = {
             row["name"]
             for row in conn.execute("pragma table_info(plans)").fetchall()
@@ -162,6 +192,16 @@ def init_db(database_path: Path) -> None:
             "allow_image": "integer not null default 0",
             "chat_models": "text not null default 'deepseek-v4.1-flash'",
             "image_models": "text not null default ''",
+            "token_limit": "integer not null default 0",
+            "daily_token_limit": "integer not null default 0",
+            "request_limit": "integer not null default 0",
+            "daily_request_limit": "integer not null default 0",
+            "image_limit": "integer not null default 0",
+            "daily_image_limit": "integer not null default 0",
+            "rpm_limit": "integer not null default 0",
+            "concurrency_limit": "integer not null default 0",
+            "chat_alias": "text not null default 'btf-chat'",
+            "image_alias": "text not null default 'btf-image'",
         }
         for column, column_type in plan_migrations.items():
             if column not in plan_columns:
@@ -202,17 +242,29 @@ def init_db(database_path: Path) -> None:
                 """
                 insert into plans (
                   id, title, duration_days, price_amount, currency, sort_order,
-                  allow_deepseek, allow_image, chat_models, image_models
+                  allow_deepseek, allow_image, chat_models, image_models,
+                  token_limit, daily_token_limit, request_limit, daily_request_limit,
+                  image_limit, daily_image_limit, rpm_limit, concurrency_limit,
+                  chat_alias, image_alias
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, 'deepseek-v4.1-flash', ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, 'deepseek-v4.1-flash', ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, 'btf-chat', 'btf-image')
                 on conflict(id) do update set
                   title = excluded.title,
                   duration_days = excluded.duration_days,
                   price_amount = excluded.price_amount,
                   currency = excluded.currency,
-                  sort_order = excluded.sort_order
+                  sort_order = excluded.sort_order,
+                  token_limit = excluded.token_limit,
+                  daily_token_limit = excluded.daily_token_limit,
+                  request_limit = excluded.request_limit,
+                  daily_request_limit = excluded.daily_request_limit,
+                  image_limit = excluded.image_limit,
+                  daily_image_limit = excluded.daily_image_limit,
+                  rpm_limit = excluded.rpm_limit,
+                  concurrency_limit = excluded.concurrency_limit
                 """,
-                (*plan, DEFAULT_IMAGE_MODELS if plan[7] else ""),
+                (*plan[:8], DEFAULT_IMAGE_MODELS if plan[7] else "", *plan[8:]),
             )
         if added_plan_entitlements:
             for plan in DEFAULT_PLANS:
@@ -222,10 +274,26 @@ def init_db(database_path: Path) -> None:
                     set allow_deepseek = ?,
                         allow_image = ?,
                         chat_models = 'deepseek-v4.1-flash',
-                        image_models = ?
+                        image_models = ?,
+                        token_limit = ?,
+                        daily_token_limit = ?,
+                        request_limit = ?,
+                        daily_request_limit = ?,
+                        image_limit = ?,
+                        daily_image_limit = ?,
+                        rpm_limit = ?,
+                        concurrency_limit = ?,
+                        chat_alias = 'btf-chat',
+                        image_alias = 'btf-image'
                     where id = ?
                     """,
-                    (plan[6], plan[7], DEFAULT_IMAGE_MODELS if plan[7] else "", plan[0]),
+                    (
+                        plan[6],
+                        plan[7],
+                        DEFAULT_IMAGE_MODELS if plan[7] else "",
+                        *plan[8:],
+                        plan[0],
+                    ),
                 )
             conn.execute(
                 """

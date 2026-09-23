@@ -129,9 +129,9 @@ def create_device(database_path: Path, device_id: str, days: int, note: str = ""
             """
             insert into devices (
               device_id, user_id, key_hash, key_mask, status, expires_at,
-              created_at, updated_at, note, plan_id
+              created_at, updated_at, note, plan_id, plan_started_at
             )
-            values (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
             """,
             (
                 device_id,
@@ -143,6 +143,7 @@ def create_device(database_path: Path, device_id: str, days: int, note: str = ""
                 ts,
                 note,
                 plan_id_for_days(days),
+                ts,
             ),
         )
     return key, get_device(database_path, device_id)
@@ -611,10 +612,10 @@ def approve_order(database_path: Path, order_id: str) -> dict:
         conn.execute(
             """
             update devices
-            set expires_at = ?, status = 'active', updated_at = ?, plan_id = ?
+            set expires_at = ?, status = 'active', updated_at = ?, plan_id = ?, plan_started_at = ?
             where device_id = ?
             """,
-            (expires_at, ts, order["plan_id"], order["device_id"]),
+            (expires_at, ts, order["plan_id"], ts, order["device_id"]),
         )
         conn.execute(
             """
