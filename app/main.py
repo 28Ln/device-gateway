@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -43,6 +45,20 @@ settings = load_settings()
 ensure_ready(settings.database_path)
 frontend_dist = Path(__file__).resolve().parents[1] / "new-api-dist"
 ADMIN_ROLE = 10
+OPENAI_V1_PREFIXES = {
+    "audio",
+    "batches",
+    "chat",
+    "completions",
+    "embeddings",
+    "files",
+    "fine_tuning",
+    "images",
+    "models",
+    "moderations",
+    "responses",
+}
+SAFE_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._~:-]+$")
 
 
 @dataclass(frozen=True)
@@ -68,6 +84,51 @@ def bearer_token(authorization: str | None) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
     return authorization.split(" ", 1)[1].strip()
+
+
+def fully_unquote_path(path: str) -> str:
+    decoded = path
+    for _ in range(3):
+        next_value = unquote(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+    return decoded
+
+
+def clean_relative_path(path: str) -> str | None:
+    decoded = fully_unquote_path(path).replace("\\", "/")
+    if not decoded or "\x00" in decoded or decoded.startswith("/") or "//" in decoded:
+        return None
+    parts = decoded.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return None
+    if any(not SAFE_PATH_SEGMENT_RE.match(part) for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def frontend_file_for_path(path: str) -> Path | None:
+    clean_path = clean_relative_path(path)
+    if clean_path is None:
+        return None
+    dist_root = frontend_dist.resolve()
+    candidate = (dist_root / clean_path).resolve()
+    try:
+        candidate.relative_to(dist_root)
+    except ValueError:
+        return None
+    return candidate
+
+
+def clean_v1_proxy_path(path: str) -> str | None:
+    clean_path = clean_relative_path(path)
+    if clean_path is None:
+        return None
+    first_segment = clean_path.split("/", 1)[0]
+    if first_segment not in OPENAI_V1_PREFIXES:
+        return None
+    return clean_path
 
 
 async def resolve_dashboard_user(
@@ -726,12 +787,15 @@ def upstream_proxy_headers(request: Request) -> dict[str, str]:
 async def proxy_v1(path: str, request: Request, authorization: str | None = Header(default=None)) -> Response:
     if not settings.new_api_token:
         raise HTTPException(status_code=500, detail="gateway missing NEW_API_TOKEN")
+    clean_path = clean_v1_proxy_path(path)
+    if clean_path is None:
+        raise HTTPException(status_code=404, detail="not found")
     auth = authenticate_device(settings.database_path, bearer_token(authorization))
     body = await request.body()
     headers = upstream_proxy_headers(request)
     headers.pop("authorization", None)
     headers["authorization"] = f"Bearer {settings.new_api_token}"
-    target = f"{settings.new_api_base_url}/v1/{path}"
+    target = f"{settings.new_api_base_url}/v1/{clean_path}"
     async with httpx.AsyncClient(timeout=120.0) as client:
         upstream = await client.request(
             request.method,
@@ -747,7 +811,7 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
     record_usage(
         settings.database_path,
         auth.device_id,
-        f"/v1/{path}",
+        f"/v1/{clean_path}",
         upstream.status_code,
         prompt,
         completion,
@@ -766,8 +830,17 @@ async def proxy_new_api(path: str, request: Request) -> Response:
     if request.method in {"GET", "HEAD"} and frontend_dist.exists():
         first = path.split("/", 1)[0]
         if first not in {"api", "v1", "health"}:
-            target_file = frontend_dist / path
-            if path and target_file.is_file():
+            if not path:
+                index_file = frontend_dist / "index.html"
+                if index_file.is_file():
+                    return FileResponse(
+                        index_file,
+                        headers={"Cache-Control": "no-store"},
+                    )
+            target_file = frontend_file_for_path(path)
+            if target_file is None:
+                raise HTTPException(status_code=404, detail="not found")
+            if target_file.is_file():
                 return FileResponse(
                     target_file,
                     headers={"Cache-Control": "no-store"},
