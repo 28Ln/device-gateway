@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import sqlite3
 import secrets
 import re
 from pathlib import Path
 
 from app.db import connect, init_db, now_ts
 from app.models import DeviceAuth
+from app.payments import PaymentIntent, PaymentNotification
 from app.security import generate_device_key, hash_key, mask_key
 
 
@@ -101,7 +103,9 @@ def create_device(database_path: Path, device_id: str, days: int, note: str = ""
         raise ValueError("days must be greater than 0")
     if user_id is not None:
         get_user(database_path, user_id)
-    key = generate_device_key()
+    # BTF devices authenticate with their stable hardware identifier. This
+    # keeps CLI, batch import, and HTTP-created devices on the same contract.
+    key = device_id
     ts = now_ts()
     expires_at = ts + days * 86400
     with connect(database_path) as conn:
@@ -119,7 +123,7 @@ def create_device(database_path: Path, device_id: str, days: int, note: str = ""
             )
             values (?, ?, ?, ?, 'active', ?, ?, ?, ?)
             """,
-            (device_id, user_id, hash_key(key), mask_key(key), expires_at, ts, ts, note),
+            (device_id, user_id, hash_key(key), key, expires_at, ts, ts, note),
         )
     return key, get_device(database_path, device_id)
 
@@ -361,18 +365,200 @@ def get_order(database_path: Path, order_id: str) -> dict:
     return dict(row)
 
 
-def list_orders(database_path: Path, limit: int = 200) -> list[dict]:
+def save_payment_intent(
+    database_path: Path,
+    order_id: str,
+    intent: PaymentIntent,
+    idempotency_key: str | None = None,
+) -> dict:
+    order = get_order(database_path, order_id)
+    if order["status"] == "approved":
+        raise InvalidState("order is already approved")
+    ts = now_ts()
     with connect(database_path) as conn:
-        rows = conn.execute(
+        existing = None
+        if idempotency_key:
+            existing = conn.execute(
+                """
+                select * from payment_transactions
+                where order_id = ? and provider = ? and idempotency_key = ?
+                order by id desc limit 1
+                """,
+                (order_id, intent.provider, idempotency_key),
+            ).fetchone()
+        if existing:
+            return dict(existing)
+        existing = conn.execute(
             """
-            select o.*, p.title as plan_title
-            from orders o
-            left join plans p on p.id = o.plan_id
-            order by o.created_at desc
-            limit ?
+            select * from payment_transactions
+            where order_id = ? and provider = ? and status in ('created', 'paid')
+            order by id desc limit 1
             """,
-            (limit,),
-        ).fetchall()
+            (order_id, intent.provider),
+        ).fetchone()
+        if existing:
+            return dict(existing)
+        try:
+            conn.execute(
+                """
+                insert into payment_transactions (
+                  order_id, provider, provider_order_id, status, amount, currency,
+                  checkout_url, idempotency_key, created_at
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order_id,
+                    intent.provider,
+                    intent.provider_order_id,
+                    intent.status,
+                    float(order["amount"]),
+                    order["currency"],
+                    intent.checkout_url,
+                    idempotency_key,
+                    ts,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            if not idempotency_key:
+                raise
+            existing = conn.execute(
+                """
+                select * from payment_transactions
+                where order_id = ? and provider = ? and idempotency_key = ?
+                """,
+                (order_id, intent.provider, idempotency_key),
+            ).fetchone()
+            if not existing:
+                raise
+            return dict(existing)
+        conn.execute(
+            """
+            update orders
+            set payment_provider = ?, provider_order_id = ?,
+                payment_url = ?, payment_expires_at = ?
+            where id = ?
+            """,
+            (
+                intent.provider,
+                intent.provider_order_id,
+                intent.checkout_url,
+                intent.expires_at,
+                order_id,
+            ),
+        )
+        row = conn.execute(
+            "select * from payment_transactions where order_id = ? and provider = ? order by id desc limit 1",
+            (order_id, intent.provider),
+        ).fetchone()
+    return dict(row)
+
+
+def list_payment_transactions(database_path: Path, order_id: str | None = None) -> list[dict]:
+    with connect(database_path) as conn:
+        if order_id:
+            rows = conn.execute(
+                """
+                select * from payment_transactions
+                where order_id = ?
+                order by id desc
+                """,
+                (order_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "select * from payment_transactions order by id desc",
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def apply_payment_notification(
+    database_path: Path,
+    notification: PaymentNotification,
+) -> dict:
+    if not notification.succeeded:
+        raise InvalidState(f"payment notification is not successful: {notification.status}")
+    with connect(database_path) as conn:
+        order = conn.execute(
+            "select * from orders where id = ?",
+            (notification.order_id,),
+        ).fetchone()
+        if not order:
+            raise NotFound(f"order not found: {notification.order_id}")
+        if round(float(notification.amount), 2) != round(float(order["amount"]), 2):
+            raise InvalidState("payment amount does not match order amount")
+        if notification.currency.upper() != str(order["currency"]).upper():
+            raise InvalidState("payment currency does not match order currency")
+        payment = conn.execute(
+            """
+            select * from payment_transactions
+            where order_id = ? and provider = ?
+            order by id desc limit 1
+            """,
+            (notification.order_id, notification.provider),
+        ).fetchone()
+        if not payment:
+            raise NotFound("payment transaction not found")
+        if notification.provider == "mock":
+            if payment["provider_order_id"] != notification.provider_order_id:
+                raise InvalidState("payment provider order id does not match")
+        elif payment["provider_order_id"] != notification.order_id:
+            raise InvalidState("payment merchant order id does not match")
+        if payment["status"] == "paid" and order["status"] == "approved":
+            return dict(order)
+        ts = now_ts()
+        conn.execute(
+            """
+            update payment_transactions
+            set status = 'paid', paid_at = ?, raw_payload = ?,
+                provider_transaction_id = ?
+            where id = ?
+            """,
+            (ts, notification.raw_payload, notification.provider_order_id, payment["id"]),
+        )
+        conn.execute(
+            """
+            update orders
+            set status = 'paid', paid_at = coalesce(paid_at, ?)
+            where id = ? and status in ('pending', 'paid')
+            """,
+            (ts, notification.order_id),
+        )
+    # Reuse the same extension logic as manual confirmation. Its approved
+    # guard makes repeated provider callbacks idempotent.
+    return approve_order(database_path, notification.order_id)
+
+
+def list_orders(
+    database_path: Path,
+    limit: int = 200,
+    user_id: int | None = None,
+) -> list[dict]:
+    with connect(database_path) as conn:
+        if user_id is None:
+            rows = conn.execute(
+                """
+                select o.*, p.title as plan_title
+                from orders o
+                left join plans p on p.id = o.plan_id
+                order by o.created_at desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                select o.*, p.title as plan_title
+                from orders o
+                join devices d on d.device_id = o.device_id
+                left join plans p on p.id = o.plan_id
+                where d.user_id = ?
+                order by o.created_at desc
+                limit ?
+                """,
+                (user_id, limit),
+            ).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -430,27 +616,33 @@ def approve_order_for_key(database_path: Path, order_id: str, device_key: str) -
     return approve_order(database_path, order_id)
 
 
-def list_usage(database_path: Path, device_id: str | None = None, limit: int = 200) -> list[dict]:
+def list_usage(
+    database_path: Path,
+    device_id: str | None = None,
+    limit: int = 200,
+    user_id: int | None = None,
+) -> list[dict]:
     with connect(database_path) as conn:
+        conditions: list[str] = []
+        params: list[object] = []
         if device_id:
-            rows = conn.execute(
-                """
-                select * from usage_events
-                where device_id = ?
-                order by id desc
-                limit ?
-                """,
-                (device_id, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                select * from usage_events
-                order by id desc
-                limit ?
-                """,
-                (limit,),
-            ).fetchall()
+            conditions.append("u.device_id = ?")
+            params.append(device_id)
+        if user_id is not None:
+            conditions.append("d.user_id = ?")
+            params.append(user_id)
+        where = f"where {' and '.join(conditions)}" if conditions else ""
+        rows = conn.execute(
+            f"""
+            select u.*
+            from usage_events u
+            join devices d on d.device_id = u.device_id
+            {where}
+            order by u.id desc
+            limit ?
+            """,
+            (*params, limit),
+        ).fetchall()
     return [dict(row) for row in rows]
 
 

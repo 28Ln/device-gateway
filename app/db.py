@@ -60,8 +60,30 @@ create table if not exists orders (
   created_at integer not null,
   paid_at integer,
   approved_at integer,
+  payment_provider text,
+  provider_order_id text,
+  payment_url text,
+  payment_expires_at integer,
   foreign key(device_id) references devices(device_id),
   foreign key(plan_id) references plans(id)
+);
+
+create table if not exists payment_transactions (
+  id integer primary key autoincrement,
+  order_id text not null,
+  provider text not null,
+  provider_order_id text not null,
+  provider_transaction_id text,
+  status text not null default 'created',
+  amount real not null,
+  currency text not null,
+  checkout_url text,
+  idempotency_key text,
+  created_at integer not null,
+  paid_at integer,
+  raw_payload text not null default '',
+  unique(provider, provider_order_id),
+  foreign key(order_id) references orders(id)
 );
 
 create table if not exists usage_events (
@@ -106,6 +128,36 @@ def init_db(database_path: Path) -> None:
         }
         if "user_id" not in device_columns:
             conn.execute("alter table devices add column user_id integer")
+        order_columns = {
+            row["name"]
+            for row in conn.execute("pragma table_info(orders)").fetchall()
+        }
+        order_migrations = {
+            "payment_provider": "text",
+            "provider_order_id": "text",
+            "payment_url": "text",
+            "payment_expires_at": "integer",
+        }
+        for column, column_type in order_migrations.items():
+            if column not in order_columns:
+                conn.execute(f"alter table orders add column {column} {column_type}")
+        payment_columns = {
+            row["name"]
+            for row in conn.execute("pragma table_info(payment_transactions)").fetchall()
+        }
+        if "idempotency_key" not in payment_columns:
+            conn.execute("alter table payment_transactions add column idempotency_key text")
+        if "provider_transaction_id" not in payment_columns:
+            conn.execute(
+                "alter table payment_transactions add column provider_transaction_id text"
+            )
+        conn.execute(
+            """
+            create unique index if not exists idx_payment_idempotency
+              on payment_transactions(order_id, provider, idempotency_key)
+              where idempotency_key is not null
+            """
+        )
         for plan in DEFAULT_PLANS:
             conn.execute(
                 """

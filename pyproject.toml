@@ -9,6 +9,7 @@ dependencies = [
   "httpx==0.28.1",
   "pydantic==2.10.4",
   "python-multipart==0.0.20",
+  "cryptography==41.0.7",
 ]
 
 [project.optional-dependencies]
@@ -19,4 +20,3 @@ test = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-

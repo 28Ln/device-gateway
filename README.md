@@ -2,10 +2,15 @@
 
 BTF Device Gateway makes a device the billable identity in front of New API.
 
+This repository contains the device gateway, not a second user system. New API
+continues to own browser login, users, roles, sessions, tokens, models, and
+upstream channels. The gateway owns device identity, device-to-user binding,
+plans, renewal orders, payment callbacks, and device usage counters.
+
 Public clients use a device key:
 
 ```text
-Authorization: Bearer btf_dev_xxx
+Authorization: Bearer BTF:AI:01:01:00:01
 Base URL: http://115.191.10.45/v1
 Model: deepseek-v4.1-flash
 ```
@@ -28,19 +33,96 @@ python -m app.cli approve-order ORDER_ID
 - `/api/device/status` returns JSON status for firmware or apps.
 - `/v1/*` validates a device API key, forwards to New API, and records usage.
 
-No standalone gateway admin pages are exposed. Device administration is handled by CLI until it is implemented inside the New API UI.
+Device administration is exposed inside the existing New API dashboard UI. The
+gateway API is mounted behind the same public origin, so customers use their
+normal New API login and do not need a second gateway token for dashboard pages.
 
 ## Users and Device Binding
 
-- `device_id` is the stable device identifier, such as SN, IMEI, MAC, or factory number.
-- `api_key` is a generated secret used for `/v1` calls. It should not be the same as `device_id`.
+- `device_id` is the stable device identifier, currently the device MAC.
+- The device MAC is also the API key used for `/v1` calls.
 - Devices can be bound to a user during single creation, prefix batch creation, or newline-based device identifier import.
-- Device keys can be rotated without changing the device identifier or user binding.
+- New devices use their MAC as the initial API key. An administrator can rotate
+  a device key for security; after rotation the old MAC key is invalid and the
+  hardware must be provisioned with the new key.
+
+## End-to-End Usage
+
+1. An administrator creates or imports a New API customer.
+2. The administrator creates devices using each hardware MAC and binds them to
+   that customer.
+3. The customer logs in through the normal New API dashboard and sees only
+   their own devices, orders, and usage.
+4. Hardware calls `http(s)://<public-host>/v1/*` with
+   `Authorization: Bearer <device-key>`.
+5. The gateway checks device status and expiration, then forwards the request
+   to New API with the internal relay token.
+6. The customer opens `/device/pay`, checks a device even when it is expired,
+   chooses a plan, creates a renewal order, and pays.
+7. A confirmed payment marks the order paid and approved, extends the device
+   from `max(current_expiration, now)`, and re-enables it.
+
+The customer never receives the internal New API relay token. The device key
+and the New API browser session are separate credentials with different scopes.
 
 ## Payment
 
-The current provider is manual confirmation. Devices create renewal orders from `/device`, and admins approve them in `/admin/orders`.
+Payment is provider-neutral and uses the same order approval path for manual
+confirmation and asynchronous provider callbacks:
 
-Set `DEMO_PAYMENT_ENABLED=true` only in test environments to show a self-service test payment button that approves the order immediately.
+1. The device creates a pending renewal order from `/device/pay`.
+2. The device starts payment with `POST /api/device/orders/{order_id}/pay`.
+3. The provider callback is received at
+   `/api/device/payments/{provider}/notify`.
+4. The gateway verifies the provider signature, amount, currency, and provider
+   order id.
+5. The callback marks the payment paid and calls the same idempotent
+   `approve_order` path, extending the device expiration once.
 
-Real payment provider callbacks should validate the provider signature, then call the same order approval path.
+Supported providers:
+
+- `wechat`: WeChat Pay API v3 native QR payments.
+- `alipay`: Alipay RSA2 precreate QR payments.
+- `mock`: local integration testing only; requires
+  `DEMO_PAYMENT_ENABLED=true` and `MOCK_PAYMENT_SECRET`.
+
+The provider credentials and callback URL are intentionally environment
+configuration, not source code. Copy `.env.example`, configure the merchant
+credentials, and use an HTTPS public callback URL before enabling a real
+provider. No real payment request is made while its required credentials are
+missing.
+
+For WeChat Pay, `WECHAT_SERIAL_NO` is the merchant API certificate serial and
+`WECHAT_PLATFORM_SERIAL_NO` is the platform certificate serial sent in
+`Wechatpay-Serial` callback headers. They are different values and both are
+required.
+
+Payment callback protections implemented:
+
+- provider signature verification;
+- amount and currency matching against the immutable order;
+- provider transaction id matching the created payment transaction;
+- idempotent handling of repeated callbacks;
+- no double extension when a callback is retried.
+
+For local tests, create an order, start it with provider `mock`, then call
+`POST /api/device/payments/mock/complete/{provider_order_id}`. This endpoint is
+disabled unless `DEMO_PAYMENT_ENABLED=true`.
+
+## Operations and Documentation
+
+- [Architecture and lifecycle](docs/ARCHITECTURE.md)
+- [Customer usage guide](docs/CUSTOMER_GUIDE.md)
+- [Deployment and payment setup](docs/OPERATIONS.md)
+- [Acceptance checklist](docs/ACCEPTANCE.md)
+
+Run the read-only gateway smoke checks with:
+
+```bash
+BTF_BASE_URL=http://115.191.10.45 \
+BTF_DEVICE_KEY='BTF:AI:01:01:00:01' \
+./scripts/smoke-test.sh
+```
+
+Add `RUN_CHAT=1` to also send a short real request to
+`deepseek-v4.1-flash`.

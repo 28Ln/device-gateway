@@ -4,4 +4,6 @@ __pycache__/
 *.pyc
 data/
 .env
-
+btf.db
+new-api-dist/
+new-api-dist.bak.*/

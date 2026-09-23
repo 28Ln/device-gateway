@@ -31,6 +31,7 @@ def test_device_lifecycle(tmp_path):
 
     key, device = create_device(db, "BTF-UNIT-001", 30)
     assert device["device_id"] == "BTF-UNIT-001"
+    assert key == "BTF-UNIT-001"
     assert authenticate_device(db, key).device_id == "BTF-UNIT-001"
 
     renewed = renew_device(db, "BTF-UNIT-001", 30)
