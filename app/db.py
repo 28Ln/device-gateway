@@ -129,6 +129,25 @@ create table if not exists usage_events (
   created_at integer not null,
   foreign key(device_id) references devices(device_id)
 );
+
+create table if not exists generated_images (
+  id integer primary key autoincrement,
+  usage_event_id integer,
+  device_id text not null,
+  user_id integer,
+  plan_id text,
+  requested_model text not null default '',
+  upstream_model text not null default '',
+  prompt text not null default '',
+  original_url text not null default '',
+  local_path text not null,
+  public_url text not null,
+  content_type text not null default '',
+  byte_size integer not null default 0,
+  created_at integer not null,
+  foreign key(usage_event_id) references usage_events(id),
+  foreign key(device_id) references devices(device_id)
+);
 """
 
 
@@ -293,6 +312,12 @@ def init_db(database_path: Path) -> None:
         )
         conn.execute(
             "create index if not exists idx_usage_device_created on usage_events(device_id, created_at)"
+        )
+        conn.execute(
+            "create index if not exists idx_generated_images_device_created on generated_images(device_id, created_at)"
+        )
+        conn.execute(
+            "create index if not exists idx_generated_images_user_created on generated_images(user_id, created_at)"
         )
         conn.execute(
             """

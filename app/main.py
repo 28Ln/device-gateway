@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import re
 import secrets
@@ -29,6 +31,7 @@ from app.service import (
     list_orders,
     list_usage,
     plans,
+    record_generated_image,
     record_usage,
     save_payment_intent,
 )
@@ -68,6 +71,7 @@ BTF_CHAT_ALIAS = "btf-chat"
 BTF_IMAGE_ALIAS = "btf-image"
 ACTIVE_REQUESTS: dict[str, int] = {}
 ACTIVE_USER_REQUESTS: dict[int, int] = {}
+MAX_GENERATED_IMAGE_BYTES = 25 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -224,6 +228,21 @@ def request_model_from_body(body: bytes) -> str:
     except Exception:
         return ""
     return str(payload.get("model") or "").strip()
+
+
+def request_prompt_from_body(body: bytes) -> str:
+    if not body:
+        return ""
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    prompt = payload.get("prompt") or payload.get("input") or ""
+    if isinstance(prompt, str):
+        return prompt
+    return json.dumps(prompt, ensure_ascii=False, separators=(",", ":"))
 
 
 def request_body_with_model(body: bytes, model: str) -> bytes:
@@ -553,11 +572,135 @@ def alias_model_response(content: bytes, content_type: str, device_id: str) -> b
     if not model:
         return content
     plan = plan_entitlements_for_device(device_id)
-    if model in (split_model_list(plan.get("chat_models")) or DEEPSEEK_MODELS):
+    chat_models = split_model_list(plan.get("chat_models")) or DEEPSEEK_MODELS
+    image_models = split_model_list(plan.get("image_models")) or DEFAULT_IMAGE_MODELS
+    normalized_image_models = {item.removeprefix("[b]") for item in image_models} | image_models
+    if model in chat_models:
         payload["model"] = plan_alias(plan, "chat_alias", BTF_CHAT_ALIAS)
-    elif model in (split_model_list(plan.get("image_models")) or DEFAULT_IMAGE_MODELS):
+    elif model in normalized_image_models:
         payload["model"] = plan_alias(plan, "image_alias", BTF_IMAGE_ALIAS)
     else:
+        return content
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def image_extension(content_type: str, data: bytes) -> str:
+    normalized = content_type.lower().split(";", 1)[0].strip()
+    if normalized == "image/jpeg" or data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if normalized == "image/webp" or data.startswith(b"RIFF") and b"WEBP" in data[:16]:
+        return ".webp"
+    if normalized == "image/gif" or data.startswith(b"GIF8"):
+        return ".gif"
+    return ".png"
+
+
+def generated_image_public_url(relative_path: str) -> str:
+    return f"{settings.public_base_url}/device-images/{relative_path}"
+
+
+def save_generated_image_bytes(data: bytes, content_type: str, index: int) -> tuple[str, str, str, int]:
+    if not data or len(data) > MAX_GENERATED_IMAGE_BYTES:
+        raise ValueError("generated image is empty or too large")
+    ext = image_extension(content_type, data)
+    day = datetime.fromtimestamp(now_ts()).strftime("%Y%m%d")
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    filename = f"{now_ts()}-{secrets.token_urlsafe(6)}-{index}-{digest}{ext}"
+    relative_path = f"{day}/{filename}"
+    target = settings.generated_images_dir / day / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    return relative_path, str(target), generated_image_public_url(relative_path), len(data)
+
+
+def decode_image_b64(value: str) -> tuple[bytes, str]:
+    content_type = "image/png"
+    encoded = value
+    if value.startswith("data:") and "," in value:
+        metadata, encoded = value.split(",", 1)
+        content_type = metadata.removeprefix("data:").split(";", 1)[0] or content_type
+    return base64.b64decode(encoded, validate=False), content_type
+
+
+async def download_image_url(url: str) -> tuple[bytes, str]:
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        response = await client.get(
+            url,
+            headers={
+                "accept": "image/*,*/*;q=0.8",
+                "user-agent": "Mozilla/5.0",
+            },
+        )
+    response.raise_for_status()
+    content_type = response.headers.get("content-type", "image/png")
+    if "image/" not in content_type.lower():
+        raise ValueError("generated image URL did not return an image")
+    if len(response.content) > MAX_GENERATED_IMAGE_BYTES:
+        raise ValueError("generated image is too large")
+    return response.content, content_type
+
+
+async def persist_image_generation_response(
+    content: bytes,
+    content_type: str,
+    device_id: str,
+    user_id: int | None,
+    plan_id: str,
+    requested_model: str,
+    upstream_model: str,
+    request_body: bytes,
+    usage_event_id: int | None,
+) -> bytes:
+    if "application/json" not in content_type.lower():
+        return content
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except Exception:
+        return content
+    data = payload.get("data")
+    if not isinstance(payload, dict) or not isinstance(data, list):
+        return content
+    prompt = request_prompt_from_body(request_body)
+    changed = False
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            continue
+        original_url = str(item.get("url") or "")
+        try:
+            if item.get("b64_json"):
+                image_bytes, image_content_type = decode_image_b64(str(item["b64_json"]))
+            elif original_url:
+                image_bytes, image_content_type = await download_image_url(original_url)
+            else:
+                continue
+            relative_path, local_path, public_url, byte_size = save_generated_image_bytes(
+                image_bytes,
+                image_content_type,
+                index,
+            )
+        except Exception:
+            continue
+        record_generated_image(
+            settings.database_path,
+            usage_event_id,
+            device_id,
+            user_id,
+            plan_id,
+            requested_model,
+            upstream_model,
+            prompt,
+            original_url,
+            local_path,
+            public_url,
+            image_content_type,
+            byte_size,
+        )
+        if original_url:
+            item["btf_original_url"] = original_url
+        item["url"] = public_url
+        item["btf_local_path"] = relative_path
+        changed = True
+    if not changed:
         return content
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
@@ -581,6 +724,21 @@ def api_device_status(authorization: str | None = Header(default=None)) -> dict[
         "request_count": device["request_count"],
         "total_tokens": device["total_tokens"],
     }
+
+
+@app.get("/device-images/{path:path}")
+def generated_device_image(path: str) -> FileResponse:
+    clean_path = clean_relative_path(path)
+    if clean_path is None:
+        raise HTTPException(status_code=404, detail="not found")
+    target = settings.generated_images_dir / clean_path
+    try:
+        target.relative_to(settings.generated_images_dir)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="not found") from None
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(target, headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 def normalize_mac(value: Any) -> str:
@@ -1560,6 +1718,7 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
         raise HTTPException(status_code=404, detail="not found")
     auth = authenticate_device(settings.database_path, bearer_token(authorization))
     body = await request.body()
+    original_body = body
     requested_model = request_model_from_body(body)
     body = enforce_plan_access(auth.device_id, clean_path, request.method, body)
     upstream_model = request_model_from_body(body)
@@ -1600,7 +1759,7 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
         completion,
         upstream_model,
     )
-    record_usage(
+    usage_event_id = record_usage(
         settings.database_path,
         auth.device_id,
         f"/v1/{clean_path}",
@@ -1615,6 +1774,18 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
         estimated_cost,
     )
     content = upstream.content
+    if upstream.status_code < 400 and clean_path == "images/generations":
+        content = await persist_image_generation_response(
+            content,
+            upstream.headers.get("content-type", ""),
+            auth.device_id,
+            user_id,
+            plan_id,
+            requested_model,
+            upstream_model,
+            original_body,
+            usage_event_id,
+        )
     if request.method == "GET" and clean_path == "models" and upstream.status_code == 200:
         content = filter_models_response(
             upstream.content,
@@ -1623,7 +1794,7 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
         )
     elif upstream.status_code < 400:
         content = alias_model_response(
-            upstream.content,
+            content,
             upstream.headers.get("content-type", ""),
             auth.device_id,
         )

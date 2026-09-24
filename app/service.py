@@ -736,10 +736,10 @@ def record_usage(
     requested_model: str = "",
     upstream_model: str = "",
     estimated_cost: float = 0,
-) -> None:
+) -> int:
     ts = now_ts()
     with connect(database_path) as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             insert into usage_events (
               device_id, user_id, plan_id, path, status_code,
@@ -776,3 +776,48 @@ def record_usage(
             """,
             (prompt_tokens, completion_tokens, total_tokens, ts, ts, device_id),
         )
+        return int(cursor.lastrowid)
+
+
+def record_generated_image(
+    database_path: Path,
+    usage_event_id: int | None,
+    device_id: str,
+    user_id: int | None,
+    plan_id: str,
+    requested_model: str,
+    upstream_model: str,
+    prompt: str,
+    original_url: str,
+    local_path: str,
+    public_url: str,
+    content_type: str,
+    byte_size: int,
+) -> int:
+    with connect(database_path) as conn:
+        cursor = conn.execute(
+            """
+            insert into generated_images (
+              usage_event_id, device_id, user_id, plan_id, requested_model,
+              upstream_model, prompt, original_url, local_path, public_url,
+              content_type, byte_size, created_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                usage_event_id,
+                device_id,
+                user_id,
+                plan_id,
+                requested_model,
+                upstream_model,
+                prompt,
+                original_url,
+                local_path,
+                public_url,
+                content_type,
+                byte_size,
+                now_ts(),
+            ),
+        )
+        return int(cursor.lastrowid)

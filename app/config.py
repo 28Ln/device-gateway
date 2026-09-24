@@ -10,6 +10,7 @@ from pathlib import Path
 class Settings:
     data_dir: Path
     database_path: Path
+    generated_images_dir: Path
     public_base_url: str
     new_api_base_url: str
     new_api_token: str
@@ -49,6 +50,7 @@ def load_settings() -> Settings:
     return Settings(
         data_dir=data_dir,
         database_path=data_dir / "btf-device-gateway.sqlite3",
+        generated_images_dir=data_dir / "generated-images",
         public_base_url=os.getenv("PUBLIC_BASE_URL", "http://115.191.10.45").rstrip("/"),
         new_api_base_url=os.getenv("NEW_API_BASE_URL", "http://127.0.0.1:3000").rstrip("/"),
         new_api_token=os.getenv("NEW_API_TOKEN", ""),

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 from dataclasses import replace
 
@@ -122,6 +124,100 @@ def test_completion_response_model_is_mapped_back_to_alias(monkeypatch, tmp_path
     )
 
     assert result["model"] == "btf-chat"
+
+
+def test_image_response_model_is_mapped_back_to_alias(monkeypatch, tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+    use_test_database(monkeypatch, db)
+    create_device(db, "BTF:PLAN:IMAGE:ALIAS", 30)
+    payload = {"model": "gpt-image-2", "data": []}
+
+    result = json.loads(
+        main.alias_model_response(
+            json.dumps(payload).encode(),
+            "application/json",
+            "BTF:PLAN:IMAGE:ALIAS",
+        )
+    )
+
+    assert result["model"] == "btf-image"
+
+
+def test_image_generation_response_is_saved(monkeypatch, tmp_path):
+    db = tmp_path / "test.sqlite3"
+    image_dir = tmp_path / "generated-images"
+    init_db(db)
+    monkeypatch.setattr(
+        main,
+        "settings",
+        replace(
+            main.settings,
+            database_path=db,
+            generated_images_dir=image_dir,
+            public_base_url="http://testserver",
+        ),
+    )
+    user = create_user(db, "image-user", "Image User")
+    create_device(db, "BTF:IMAGE:SAVE", 30, user_id=user["id"])
+    usage_event_id = record_usage(
+        db,
+        "BTF:IMAGE:SAVE",
+        "/v1/images/generations",
+        200,
+        user_id=user["id"],
+        plan_id="month_1",
+        requested_model="btf-image",
+        upstream_model="[b]gpt-image-2",
+    )
+    payload = {
+        "model": "gpt-image-2",
+        "data": [
+            {
+                "b64_json": base64.b64encode(
+                    b"\x89PNG\r\n\x1a\n" + b"test-image"
+                ).decode()
+            }
+        ],
+    }
+
+    result = json.loads(
+        asyncio.run(
+            main.persist_image_generation_response(
+                json.dumps(payload).encode(),
+                "application/json",
+                "BTF:IMAGE:SAVE",
+                user["id"],
+                "month_1",
+                "btf-image",
+                "[b]gpt-image-2",
+                json.dumps({"prompt": "red square"}).encode(),
+                usage_event_id,
+            )
+        )
+    )
+
+    public_url = result["data"][0]["url"]
+    assert public_url.startswith("http://testserver/device-images/")
+    relative_path = result["data"][0]["btf_local_path"]
+    assert (image_dir / relative_path).is_file()
+    with connect(db) as conn:
+        row = conn.execute(
+            """
+            select usage_event_id, device_id, user_id, plan_id, requested_model,
+                   upstream_model, prompt, public_url, byte_size
+            from generated_images
+            """
+        ).fetchone()
+    assert row["usage_event_id"] == usage_event_id
+    assert row["device_id"] == "BTF:IMAGE:SAVE"
+    assert row["user_id"] == user["id"]
+    assert row["plan_id"] == "month_1"
+    assert row["requested_model"] == "btf-image"
+    assert row["upstream_model"] == "[b]gpt-image-2"
+    assert row["prompt"] == "red square"
+    assert row["public_url"] == public_url
+    assert row["byte_size"] > 0
 
 
 def test_plan_request_limit_blocks_device(monkeypatch, tmp_path):
