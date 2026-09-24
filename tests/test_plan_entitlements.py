@@ -220,6 +220,86 @@ def test_image_generation_response_is_saved(monkeypatch, tmp_path):
     assert row["byte_size"] > 0
 
 
+def test_generated_images_api_filters_by_customer(monkeypatch, tmp_path):
+    db = tmp_path / "test.sqlite3"
+    image_dir = tmp_path / "generated-images"
+    init_db(db)
+    monkeypatch.setattr(
+        main,
+        "settings",
+        replace(
+            main.settings,
+            database_path=db,
+            generated_images_dir=image_dir,
+            public_base_url="http://testserver",
+        ),
+    )
+    user_a = create_user(db, "image-user-a", "Image User A")
+    user_b = create_user(db, "image-user-b", "Image User B")
+    create_device(db, "BTF:IMAGE:USER:A", 30, user_id=user_a["id"])
+    create_device(db, "BTF:IMAGE:USER:B", 30, user_id=user_b["id"])
+    for device_id, user_id, prompt in [
+        ("BTF:IMAGE:USER:A", user_a["id"], "alpha prompt"),
+        ("BTF:IMAGE:USER:B", user_b["id"], "beta prompt"),
+    ]:
+        usage_event_id = record_usage(
+            db,
+            device_id,
+            "/v1/images/generations",
+            200,
+            user_id=user_id,
+            plan_id="month_1",
+            requested_model="btf-image",
+            upstream_model="[b]gpt-image-2",
+        )
+        asyncio.run(
+            main.persist_image_generation_response(
+                json.dumps(
+                    {
+                        "data": [
+                            {
+                                "b64_json": base64.b64encode(
+                                    b"\x89PNG\r\n\x1a\n" + prompt.encode()
+                                ).decode()
+                            }
+                        ]
+                    }
+                ).encode(),
+                "application/json",
+                device_id,
+                user_id,
+                "month_1",
+                "btf-image",
+                "[b]gpt-image-2",
+                json.dumps({"prompt": prompt}).encode(),
+                usage_event_id,
+            )
+        )
+
+    async def fake_customer(request, authorization):
+        return main.DashboardUser(id=user_a["id"], role=1, username=user_a["username"])
+
+    monkeypatch.setattr(main, "resolve_dashboard_user", fake_customer)
+    client = TestClient(main.app)
+    response = client.get("/api/device/images")
+
+    assert response.status_code == 200
+    items = response.json()["data"]["items"]
+    assert [item["device_id"] for item in items] == ["BTF:IMAGE:USER:A"]
+    assert items[0]["prompt"] == "alpha prompt"
+
+    async def fake_admin(request, authorization):
+        return main.DashboardUser(id=1, role=main.ADMIN_ROLE, username="admin")
+
+    monkeypatch.setattr(main, "resolve_dashboard_user", fake_admin)
+    response = client.get("/api/device/images", params={"device_id": "BTF:IMAGE:USER:B"})
+
+    assert response.status_code == 200
+    items = response.json()["data"]["items"]
+    assert [item["device_id"] for item in items] == ["BTF:IMAGE:USER:B"]
+    assert items[0]["prompt"] == "beta prompt"
+
+
 def test_plan_request_limit_blocks_device(monkeypatch, tmp_path):
     db = tmp_path / "test.sqlite3"
     init_db(db)

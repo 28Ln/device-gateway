@@ -723,6 +723,37 @@ def list_usage(
     return [dict(row) for row in rows]
 
 
+def list_generated_images(
+    database_path: Path,
+    device_id: str | None = None,
+    limit: int = 200,
+    user_id: int | None = None,
+) -> list[dict]:
+    with connect(database_path) as conn:
+        conditions: list[str] = []
+        params: list[object] = []
+        if device_id:
+            conditions.append("g.device_id = ?")
+            params.append(device_id)
+        if user_id is not None:
+            conditions.append("d.user_id = ?")
+            params.append(user_id)
+        where = f"where {' and '.join(conditions)}" if conditions else ""
+        rows = conn.execute(
+            f"""
+            select g.*, u.username as owner_username, u.display_name as owner_display_name
+            from generated_images g
+            join devices d on d.device_id = g.device_id
+            left join users u on u.id = g.user_id
+            {where}
+            order by g.id desc
+            limit ?
+            """,
+            (*params, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def record_usage(
     database_path: Path,
     device_id: str,

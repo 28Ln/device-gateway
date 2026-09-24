@@ -28,6 +28,7 @@ from app.service import (
     ensure_ready,
     get_order,
     get_device_by_key,
+    list_generated_images,
     list_orders,
     list_usage,
     plans,
@@ -1469,6 +1470,23 @@ async def api_list_device_usage(
         settings.database_path,
         normalize_mac(device_id) or None,
         limit,
+        None if dashboard_user.is_admin else dashboard_user.id,
+    )
+    return {"success": True, "message": "", "data": {"items": items, "total": len(items)}}
+
+
+@app.get("/api/device/images")
+async def api_list_device_images(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    device_id: str = "",
+    limit: int = 200,
+) -> dict[str, Any]:
+    dashboard_user = await resolve_dashboard_user(request, authorization)
+    items = list_generated_images(
+        settings.database_path,
+        normalize_mac(device_id) or None,
+        max(1, min(limit, 500)),
         None if dashboard_user.is_admin else dashboard_user.id,
     )
     return {"success": True, "message": "", "data": {"items": items, "total": len(items)}}
