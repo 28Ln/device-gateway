@@ -12,10 +12,15 @@ Public clients use a device key:
 ```text
 Authorization: Bearer BTF:AI:01:01:00:01
 Base URL: http://115.191.10.45/v1
-Model: deepseek-v4.1-flash
+Default model: deepseek-v4.1-flash
+Optional model: gpt-5.5 (web search enabled)
 ```
 
-The gateway validates device status and expiry, then forwards requests to New API with the internal relay token.
+The gateway validates device status and expiry, then forwards requests to New
+API with the internal relay token. `/v1/models` exposes the models enabled for
+the device plan. `btf-chat` remains a compatibility alias for the default
+DeepSeek model; selecting `gpt-5.5` automatically adds the upstream
+`web_search` tool.
 
 ## Commands
 

@@ -7,7 +7,8 @@ For each device, provide:
 ```text
 API Base URL: https://<public-host>/v1
 API Key: <current device key>
-Model: deepseek-v4.1-flash
+Default model: deepseek-v4.1-flash
+Optional model: gpt-5.5 (web search enabled)
 Renewal URL: https://<public-host>/device/pay?mac=<device-key>
 ```
 
@@ -35,6 +36,10 @@ List models:
 curl https://<public-host>/v1/models \
   -H 'Authorization: Bearer <device-key>'
 ```
+
+When `gpt-5.5` is selected, the gateway automatically adds
+`{"type":"web_search"}` to the request tools. DeepSeek remains the default
+model and does not receive the web-search tool.
 
 Check device status:
 

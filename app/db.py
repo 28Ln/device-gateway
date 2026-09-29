@@ -159,7 +159,8 @@ DEFAULT_PLANS = [
     ("month_1", "30天月卡", 30, 99.99, "CNY", 40, 1, 1, 3_000_000, 200_000, 30_000, 2_000, 100, 10, 60, 2),
 ]
 
-DEFAULT_IMAGE_MODELS = "[b]gpt-image-2"
+DEFAULT_CHAT_MODELS = "deepseek-v4.1-flash,gpt-5.5"
+DEFAULT_IMAGE_MODELS = "[b2]gpt-image-2"
 
 
 @contextmanager
@@ -336,7 +337,7 @@ def init_db(database_path: Path) -> None:
                   image_limit, daily_image_limit, rpm_limit, concurrency_limit,
                   chat_alias, image_alias
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, 'deepseek-v4.1-flash', ?,
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?, ?, ?, 'btf-chat', 'btf-image')
                 on conflict(id) do update set
                   title = excluded.title,
@@ -353,7 +354,12 @@ def init_db(database_path: Path) -> None:
                   rpm_limit = excluded.rpm_limit,
                   concurrency_limit = excluded.concurrency_limit
                 """,
-                (*plan[:8], DEFAULT_IMAGE_MODELS if plan[7] else "", *plan[8:]),
+                (
+                    *plan[:8],
+                    DEFAULT_CHAT_MODELS,
+                    DEFAULT_IMAGE_MODELS if plan[7] else "",
+                    *plan[8:],
+                ),
             )
         if added_plan_entitlements:
             for plan in DEFAULT_PLANS:
@@ -362,7 +368,7 @@ def init_db(database_path: Path) -> None:
                     update plans
                     set allow_deepseek = ?,
                         allow_image = ?,
-                        chat_models = 'deepseek-v4.1-flash',
+                        chat_models = ?,
                         image_models = ?,
                         token_limit = ?,
                         daily_token_limit = ?,
@@ -379,6 +385,7 @@ def init_db(database_path: Path) -> None:
                     (
                         plan[6],
                         plan[7],
+                        DEFAULT_CHAT_MODELS,
                         DEFAULT_IMAGE_MODELS if plan[7] else "",
                         *plan[8:],
                         plan[0],
@@ -392,6 +399,41 @@ def init_db(database_path: Path) -> None:
                 """,
                 (DEFAULT_IMAGE_MODELS,),
             )
+
+        # Forward migration for installations that already had the plan
+        # entitlement columns (so ``added_plan_entitlements`` is false). Those
+        # rows still carry the previous built-in defaults and would otherwise
+        # never gain the GPT-5.5 chat model or the corrected image model. Only
+        # rows whose value exactly equals the old built-in default are
+        # rewritten, so administrator-customized plans stay untouched.
+        previous_chat_models = "deepseek-v4.1-flash"
+        previous_image_models = "[b]gpt-image-2"
+        for plan in DEFAULT_PLANS:
+            conn.execute(
+                """
+                update plans
+                set chat_models = ?
+                where id = ? and chat_models = ?
+                """,
+                (DEFAULT_CHAT_MODELS, plan[0], previous_chat_models),
+            )
+            if plan[7]:
+                conn.execute(
+                    """
+                    update plans
+                    set image_models = ?
+                    where id = ? and image_models = ?
+                    """,
+                    (DEFAULT_IMAGE_MODELS, plan[0], previous_image_models),
+                )
+        conn.execute(
+            """
+            update plans
+            set image_models = ?
+            where allow_image = 1 and (image_models is null or image_models = '')
+            """,
+            (DEFAULT_IMAGE_MODELS,),
+        )
         conn.execute(
             """
             update devices

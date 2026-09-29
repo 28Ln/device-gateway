@@ -36,13 +36,24 @@ def test_day_plan_allows_deepseek_and_blocks_image(monkeypatch, tmp_path):
         body("btf-chat"),
     )
     assert json.loads(rewritten)["model"] == "deepseek-v4.1-flash"
+    assert "tools" not in json.loads(rewritten)
+
+    gpt_request = main.enforce_plan_access(
+        "BTF:PLAN:DAY",
+        "chat/completions",
+        "POST",
+        body("gpt-5.5"),
+    )
+    gpt_payload = json.loads(gpt_request)
+    assert gpt_payload["model"] == "gpt-5.5"
+    assert gpt_payload["tools"] == [{"type": "web_search"}]
 
     with pytest.raises(HTTPException) as exc:
         main.enforce_plan_access(
             "BTF:PLAN:DAY",
             "images/generations",
             "POST",
-            body("[b]gpt-image-2"),
+            body("[b2]gpt-image-2"),
         )
     assert exc.value.status_code == 403
 
@@ -59,7 +70,7 @@ def test_month_plan_allows_configured_image_models(monkeypatch, tmp_path):
         "POST",
         body("btf-image"),
     )
-    assert json.loads(rewritten)["model"] == "[b]gpt-image-2"
+    assert json.loads(rewritten)["model"] == "[b2]gpt-image-2"
 
     with pytest.raises(HTTPException) as exc:
         main.enforce_plan_access(
@@ -81,7 +92,7 @@ def test_models_response_is_filtered_by_plan(monkeypatch, tmp_path):
         "object": "list",
         "data": [
             {"id": "deepseek-v4.1-flash"},
-            {"id": "[b]gpt-image-2"},
+            {"id": "[b2]gpt-image-2"},
             {"id": "gemini-2.5-flash-image-preview"},
         ],
     }
@@ -93,7 +104,11 @@ def test_models_response_is_filtered_by_plan(monkeypatch, tmp_path):
             "BTF:PLAN:DAY",
         )
     )
-    assert [item["id"] for item in day_models["data"]] == ["btf-chat"]
+    assert [item["id"] for item in day_models["data"]] == [
+        "btf-chat",
+        "deepseek-v4.1-flash",
+        "gpt-5.5",
+    ]
 
     month_models = json.loads(
         main.filter_models_response(
@@ -104,6 +119,8 @@ def test_models_response_is_filtered_by_plan(monkeypatch, tmp_path):
     )
     assert [item["id"] for item in month_models["data"]] == [
         "btf-chat",
+        "deepseek-v4.1-flash",
+        "gpt-5.5",
         "btf-image",
     ]
 
@@ -124,6 +141,95 @@ def test_completion_response_model_is_mapped_back_to_alias(monkeypatch, tmp_path
     )
 
     assert result["model"] == "btf-chat"
+
+
+def test_alternate_chat_model_response_keeps_selected_model(monkeypatch, tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+    use_test_database(monkeypatch, db)
+    create_device(db, "BTF:PLAN:GPT:ALIAS", 1)
+    payload = {"model": "gpt-5.5", "choices": []}
+
+    result = json.loads(
+        main.alias_model_response(
+            json.dumps(payload).encode(),
+            "application/json",
+            "BTF:PLAN:GPT:ALIAS",
+        )
+    )
+
+    assert result["model"] == "gpt-5.5"
+
+
+def test_web_search_tool_is_added_without_duplicates(monkeypatch, tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+    use_test_database(monkeypatch, db)
+    create_device(db, "BTF:PLAN:TOOLS", 1)
+
+    with_other_tool = json.dumps(
+        {
+            "model": "gpt-5.5",
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "demo"}}],
+        }
+    ).encode()
+    rewritten = json.loads(
+        main.enforce_plan_access(
+            "BTF:PLAN:TOOLS",
+            "chat/completions",
+            "POST",
+            with_other_tool,
+        )
+    )
+    assert [tool["type"] for tool in rewritten["tools"]] == [
+        "function",
+        "web_search",
+    ]
+
+    with_search = json.dumps(
+        {
+            "model": "gpt-5.5",
+            "messages": [],
+            "tools": [{"type": "web_search"}],
+        }
+    ).encode()
+    unchanged_count = json.loads(
+        main.enforce_plan_access(
+            "BTF:PLAN:TOOLS",
+            "chat/completions",
+            "POST",
+            with_search,
+        )
+    )["tools"].count({"type": "web_search"})
+    assert unchanged_count == 1
+
+
+def test_deepseek_does_not_receive_web_search(monkeypatch, tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+    use_test_database(monkeypatch, db)
+    create_device(db, "BTF:PLAN:DEEPSEEK", 1)
+    request = json.dumps(
+        {
+            "model": "deepseek-v4.1-flash",
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "demo"}}],
+        }
+    ).encode()
+
+    rewritten = json.loads(
+        main.enforce_plan_access(
+            "BTF:PLAN:DEEPSEEK",
+            "chat/completions",
+            "POST",
+            request,
+        )
+    )
+
+    assert rewritten["tools"] == [
+        {"type": "function", "function": {"name": "demo"}}
+    ]
 
 
 def test_image_response_model_is_mapped_back_to_alias(monkeypatch, tmp_path):
@@ -168,7 +274,7 @@ def test_image_generation_response_is_saved(monkeypatch, tmp_path):
         user_id=user["id"],
         plan_id="month_1",
         requested_model="btf-image",
-        upstream_model="[b]gpt-image-2",
+        upstream_model="[b2]gpt-image-2",
     )
     payload = {
         "model": "gpt-image-2",
@@ -190,7 +296,7 @@ def test_image_generation_response_is_saved(monkeypatch, tmp_path):
                 user["id"],
                 "month_1",
                 "btf-image",
-                "[b]gpt-image-2",
+                "[b2]gpt-image-2",
                 json.dumps({"prompt": "red square"}).encode(),
                 usage_event_id,
             )
@@ -214,7 +320,7 @@ def test_image_generation_response_is_saved(monkeypatch, tmp_path):
     assert row["user_id"] == user["id"]
     assert row["plan_id"] == "month_1"
     assert row["requested_model"] == "btf-image"
-    assert row["upstream_model"] == "[b]gpt-image-2"
+    assert row["upstream_model"] == "[b2]gpt-image-2"
     assert row["prompt"] == "red square"
     assert row["public_url"] == public_url
     assert row["byte_size"] > 0
@@ -250,7 +356,7 @@ def test_generated_images_api_filters_by_customer(monkeypatch, tmp_path):
             user_id=user_id,
             plan_id="month_1",
             requested_model="btf-image",
-            upstream_model="[b]gpt-image-2",
+            upstream_model="[b2]gpt-image-2",
         )
         asyncio.run(
             main.persist_image_generation_response(
@@ -270,7 +376,7 @@ def test_generated_images_api_filters_by_customer(monkeypatch, tmp_path):
                 user_id,
                 "month_1",
                 "btf-image",
-                "[b]gpt-image-2",
+                "[b2]gpt-image-2",
                 json.dumps({"prompt": prompt}).encode(),
                 usage_event_id,
             )
@@ -498,3 +604,105 @@ def test_approved_order_updates_current_device_plan(tmp_path):
             ("BTF:PLAN:ORDER",),
         ).fetchone()
     assert row["plan_id"] == "month_1"
+
+
+def test_btf_chat_alias_uses_deepseek_default_when_alternate_sorts_first(monkeypatch, tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+    use_test_database(monkeypatch, db)
+    create_device(db, "BTF:PLAN:ALIAS", 1)
+    with connect(db) as conn:
+        conn.execute(
+            "update plans set chat_models = ? where id = ?",
+            ("alternate-model,deepseek-v4.1-flash,gpt-5.5", "day_1"),
+        )
+
+    plan = main.plan_entitlements_for_device("BTF:PLAN:ALIAS")
+    rewritten = main.enforce_plan_access(
+        "BTF:PLAN:ALIAS",
+        "chat/completions",
+        "POST",
+        body("btf-chat"),
+    )
+    assert json.loads(rewritten)["model"] == "deepseek-v4.1-flash"
+
+    response = main.alias_model_response(
+        json.dumps({"model": "deepseek-v4.1-flash"}).encode(),
+        "application/json",
+        "BTF:PLAN:ALIAS",
+    )
+    assert json.loads(response)["model"] == "btf-chat"
+    assert main.actual_model_for_request(plan, "chat", "btf-chat") == "deepseek-v4.1-flash"
+
+
+def test_existing_plan_defaults_are_forward_migrated_without_overwriting_custom_values(tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+    with connect(db) as conn:
+        conn.execute(
+            "update plans set chat_models = ? where id = ?",
+            ("deepseek-v4.1-flash", "day_1"),
+        )
+        conn.execute(
+            "update plans set image_models = ? where id = ?",
+            ("[b]gpt-image-2", "month_1"),
+        )
+        conn.execute(
+            "update plans set chat_models = ? where id = ?",
+            ("my-custom-model", "week_1"),
+        )
+    init_db(db)
+
+    with connect(db) as conn:
+        day = conn.execute(
+            "select chat_models from plans where id = ?",
+            ("day_1",),
+        ).fetchone()
+        month = conn.execute(
+            "select image_models from plans where id = ?",
+            ("month_1",),
+        ).fetchone()
+        custom = conn.execute(
+            "select chat_models from plans where id = ?",
+            ("week_1",),
+        ).fetchone()
+    assert day["chat_models"] == "deepseek-v4.1-flash,gpt-5.5"
+    assert month["image_models"] == "[b2]gpt-image-2"
+    assert custom["chat_models"] == "my-custom-model"
+
+
+def test_customer_usage_logs_use_sql_pagination_and_keep_total(monkeypatch, tmp_path):
+    db = tmp_path / "test.sqlite3"
+    init_db(db)
+    use_test_database(monkeypatch, db)
+    user = create_user(db, "usage-page-user", "Usage Page User")
+    create_device(db, "BTF:USAGE:PAGE", 1, user_id=user["id"])
+    for index in range(3):
+        record_usage(
+            db,
+            "BTF:USAGE:PAGE",
+            "/v1/chat/completions",
+            200,
+            index + 1,
+            0,
+            index + 1,
+            user["id"],
+            "day_1",
+            "btf-chat",
+            "deepseek-v4.1-flash",
+            0,
+        )
+
+    async def fake_dashboard_user(request, authorization):
+        return main.DashboardUser(id=user["id"], role=1, username="usage-page-user")
+
+    monkeypatch.setattr(main, "resolve_dashboard_user", fake_dashboard_user)
+    client = TestClient(main.app)
+    response = client.get("/api/log/self?p=2&page_size=1")
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["total"] == 3
+    assert payload["page"] == 2
+    assert payload["page_size"] == 1
+    assert len(payload["items"]) == 1

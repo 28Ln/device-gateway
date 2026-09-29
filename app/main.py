@@ -16,7 +16,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
 from app.config import load_settings
-from app.db import connect
+from app.db import DEFAULT_CHAT_MODELS, connect
 from app.db import now_ts
 from app.service import (
     DeviceError,
@@ -66,8 +66,9 @@ OPENAI_V1_PREFIXES = {
 }
 SAFE_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._~:-]+$")
 DEEPSEEK_MODELS = {"deepseek-v4.1-flash"}
-DEFAULT_IMAGE_MODELS = {"[b]gpt-image-2"}
-DEFAULT_IMAGE_MODEL_TEXT = "[b]gpt-image-2"
+WEB_SEARCH_MODELS = {"gpt-5.5"}
+DEFAULT_IMAGE_MODELS = {"[b2]gpt-image-2"}
+DEFAULT_IMAGE_MODEL_TEXT = "[b2]gpt-image-2"
 BTF_CHAT_ALIAS = "btf-chat"
 BTF_IMAGE_ALIAS = "btf-image"
 ACTIVE_REQUESTS: dict[str, int] = {}
@@ -259,6 +260,27 @@ def request_body_with_model(body: bytes, model: str) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def request_body_with_web_search(body: bytes, model: str) -> bytes:
+    """Enable web search only for the upstream models that support it."""
+    if model not in WEB_SEARCH_MODELS:
+        return body
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return body
+    if not isinstance(payload, dict):
+        return body
+    tools = payload.get("tools")
+    if tools is None:
+        payload["tools"] = [{"type": "web_search"}]
+    elif isinstance(tools, list) and not any(
+        isinstance(tool, dict) and tool.get("type") == "web_search"
+        for tool in tools
+    ):
+        payload["tools"] = [*tools, {"type": "web_search"}]
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 def plan_id_from_text(value: str) -> str:
     normalized = value.strip().lower()
     mapping = {
@@ -332,7 +354,10 @@ def user_limits_for_id(user_id: int) -> dict[str, Any] | None:
 def allowed_models_for_plan(plan: dict[str, Any]) -> set[str]:
     allowed: set[str] = set()
     if int(plan.get("allow_deepseek") or 0):
-        allowed.update(split_model_list(plan.get("chat_models")) or DEEPSEEK_MODELS)
+        allowed.update(
+            split_model_list(plan.get("chat_models"))
+            or split_model_list(DEFAULT_CHAT_MODELS)
+        )
     if int(plan.get("allow_image") or 0):
         allowed.update(split_model_list(plan.get("image_models")) or DEFAULT_IMAGE_MODELS)
     return allowed
@@ -351,6 +376,13 @@ def plan_alias(plan: dict[str, Any], key: str, fallback: str) -> str:
     return str(plan.get(key) or fallback).strip() or fallback
 
 
+def default_chat_model(chat_models: set[str]) -> str:
+    """Return the model used when a client selects the btf-chat alias."""
+    if "deepseek-v4.1-flash" in chat_models:
+        return "deepseek-v4.1-flash"
+    return sorted(chat_models)[0]
+
+
 def actual_model_for_request(plan: dict[str, Any], first: str, requested_model: str) -> str:
     if first == "images":
         if not int(plan.get("allow_image") or 0):
@@ -365,10 +397,16 @@ def actual_model_for_request(plan: dict[str, Any], first: str, requested_model: 
     if first in {"chat", "completions", "responses"}:
         if not int(plan.get("allow_deepseek") or 0):
             raise HTTPException(status_code=403, detail="current device plan does not include DeepSeek")
-        chat_models = split_model_list(plan.get("chat_models")) or DEEPSEEK_MODELS
+        chat_models = split_model_list(plan.get("chat_models")) or split_model_list(
+            DEFAULT_CHAT_MODELS
+        )
         chat_alias = plan_alias(plan, "chat_alias", BTF_CHAT_ALIAS)
         if requested_model == chat_alias:
-            return sorted(chat_models)[0]
+            # The compatibility alias must resolve to the same default model
+            # that alias_model_response() maps back. Using sorted()[0] could
+            # pick an alternate model when the plan lists one that sorts
+            # before the default DeepSeek model.
+            return default_chat_model(chat_models)
         if requested_model in chat_models:
             return requested_model
         raise HTTPException(status_code=403, detail="chat model is not included in current device plan")
@@ -526,7 +564,8 @@ def enforce_plan_access(device_id: str, path: str, method: str, body: bytes) -> 
     if not model:
         raise HTTPException(status_code=400, detail="model is required")
     actual_model = actual_model_for_request(plan, first, model)
-    return request_body_with_model(body, actual_model)
+    rewritten = request_body_with_model(body, actual_model)
+    return request_body_with_web_search(rewritten, actual_model)
 
 
 def filter_models_response(content: bytes, content_type: str, device_id: str) -> bytes:
@@ -541,13 +580,21 @@ def filter_models_response(content: bytes, content_type: str, device_id: str) ->
     plan = plan_entitlements_for_device(device_id)
     data: list[dict[str, Any]] = []
     if int(plan.get("allow_deepseek") or 0):
-        data.append({
-            "id": plan_alias(plan, "chat_alias", BTF_CHAT_ALIAS),
-            "object": "model",
-            "created": 1626777600,
-            "owned_by": "btf",
-            "supported_endpoint_types": ["chat", "openai"],
-        })
+        chat_models = sorted(
+            split_model_list(plan.get("chat_models"))
+            or split_model_list(DEFAULT_CHAT_MODELS)
+        )
+        chat_ids = [plan_alias(plan, "chat_alias", BTF_CHAT_ALIAS)]
+        if len(chat_models) > 1:
+            chat_ids.extend(chat_models)
+        for model_id in dict.fromkeys(chat_ids):
+            data.append({
+                "id": model_id,
+                "object": "model",
+                "created": 1626777600,
+                "owned_by": "btf",
+                "supported_endpoint_types": ["chat", "openai"],
+            })
     if int(plan.get("allow_image") or 0):
         data.append({
             "id": plan_alias(plan, "image_alias", BTF_IMAGE_ALIAS),
@@ -573,11 +620,20 @@ def alias_model_response(content: bytes, content_type: str, device_id: str) -> b
     if not model:
         return content
     plan = plan_entitlements_for_device(device_id)
-    chat_models = split_model_list(plan.get("chat_models")) or DEEPSEEK_MODELS
+    chat_models = split_model_list(plan.get("chat_models")) or split_model_list(
+        DEFAULT_CHAT_MODELS
+    )
     image_models = split_model_list(plan.get("image_models")) or DEFAULT_IMAGE_MODELS
-    normalized_image_models = {item.removeprefix("[b]") for item in image_models} | image_models
+    normalized_image_models = {
+        item.split("]", 1)[1] if item.startswith("[") and "]" in item else item
+        for item in image_models
+    } | image_models
     if model in chat_models:
-        payload["model"] = plan_alias(plan, "chat_alias", BTF_CHAT_ALIAS)
+        if model == default_chat_model(chat_models):
+            payload["model"] = plan_alias(plan, "chat_alias", BTF_CHAT_ALIAS)
+        else:
+            # Keep explicitly selected alternate models visible to clients.
+            payload["model"] = model
     elif model in normalized_image_models:
         payload["model"] = plan_alias(plan, "image_alias", BTF_IMAGE_ALIAS)
     else:
@@ -1225,7 +1281,7 @@ async def api_update_device_plan(
         chat_models = str(
             payload.get("chat_models")
             if "chat_models" in payload
-            else current.get("chat_models") or "deepseek-v4.1-flash"
+            else current.get("chat_models") or DEFAULT_CHAT_MODELS
         ).strip()
         image_models = str(
             payload.get("image_models")
@@ -1521,6 +1577,357 @@ def user_usage_rows(user_id: int | None = None) -> list[dict[str, Any]]:
             (today_started_at, today_started_at, today_started_at, *params),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def btf_usage_where(
+    user_id: int,
+    request: Request,
+) -> tuple[str, list[Any]]:
+    """Build a customer-scoped usage query.
+
+    ``usage_events.user_id`` is authoritative for new records. The device
+    owner fallback keeps older records visible after the migration that added
+    the column.
+    """
+    conditions = ["coalesce(e.user_id, d.user_id) = ?"]
+    params: list[Any] = [user_id]
+    query = request.query_params
+
+    try:
+        start_timestamp = int(query.get("start_timestamp") or 0)
+    except ValueError:
+        start_timestamp = 0
+    try:
+        end_timestamp = int(query.get("end_timestamp") or 0)
+    except ValueError:
+        end_timestamp = 0
+    if start_timestamp > 0:
+        conditions.append("e.created_at >= ?")
+        params.append(start_timestamp)
+    if end_timestamp > 0:
+        conditions.append("e.created_at <= ?")
+        params.append(end_timestamp)
+
+    model_name = str(query.get("model_name") or "").strip()
+    if model_name:
+        conditions.append(
+            "(e.requested_model = ? or e.upstream_model = ? or e.path like ?)"
+        )
+        params.extend([model_name, model_name, f"%{model_name}%"])
+
+    token_name = str(query.get("token_name") or "").strip()
+    if token_name:
+        conditions.append("e.device_id like ?")
+        params.append(f"%{token_name}%")
+
+    group = str(query.get("group") or "").strip()
+    if group:
+        conditions.append("coalesce(e.plan_id, '') = ?")
+        params.append(group)
+
+    try:
+        log_type = int(query.get("type") or 0)
+    except ValueError:
+        log_type = 0
+    if log_type == 2:
+        conditions.append("e.status_code < 400")
+    elif log_type == 5:
+        conditions.append("e.status_code >= 400")
+    elif log_type not in {0, 2, 5}:
+        conditions.append("1 = 0")
+
+    return " and ".join(conditions), params
+
+
+def btf_usage_model(path: str, requested_model: str, upstream_model: str) -> str:
+    return (
+        requested_model
+        or upstream_model
+        or ("btf-image" if "/images/" in path else "btf-chat" if "/chat/" in path else path.rsplit("/", 1)[-1])
+    )
+
+
+def btf_usage_log_row(row: dict[str, Any], username: str) -> dict[str, Any]:
+    path = str(row.get("path") or "")
+    requested_model = str(row.get("requested_model") or "")
+    upstream_model = str(row.get("upstream_model") or "")
+    status_code = int(row.get("status_code") or 0)
+    total_tokens = int(row.get("total_tokens") or 0)
+    log_type = 2 if status_code < 400 else 5
+    other = {
+        "btf": True,
+        "device_id": row.get("device_id") or "",
+        "device_numeric_id": int(row.get("device_numeric_id") or 0),
+        "plan_id": row.get("plan_id") or "",
+        "status_code": status_code,
+        "upstream_model": upstream_model,
+        "estimated_cost": float(row.get("estimated_cost") or 0),
+    }
+    return {
+        "id": int(row["id"]),
+        "user_id": int(row.get("effective_user_id") or row.get("user_id") or 0),
+        "created_at": int(row.get("created_at") or 0),
+        "type": log_type,
+        "content": f"{path} · {row.get('device_id') or ''}",
+        "username": username,
+        "token_name": row.get("device_id") or "",
+        "model_name": btf_usage_model(path, requested_model, upstream_model),
+        # BTF is subscription/token based. The New API quota fields are
+        # populated with token units so existing charts remain meaningful.
+        "quota": total_tokens,
+        "prompt_tokens": int(row.get("prompt_tokens") or 0),
+        "completion_tokens": int(row.get("completion_tokens") or 0),
+        "use_time": 0,
+        "is_stream": False,
+        "channel": 0,
+        "channel_name": "BTF Device Gateway",
+        "token_id": int(row.get("device_numeric_id") or 0),
+        "group": row.get("plan_id") or "",
+        "ip": "",
+        "other": json.dumps(other, ensure_ascii=False, separators=(",", ":")),
+        "request_id": f"btf-usage-{int(row['id'])}",
+        "upstream_request_id": "",
+    }
+
+
+def btf_usage_events(
+    user_id: int,
+    request: Request,
+    *,
+    successful_only: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    where, params = btf_usage_where(user_id, request)
+    if successful_only:
+        where += " and e.status_code < 400"
+    pagination = ""
+    if limit is not None:
+        pagination = " limit ? offset ?"
+    with connect(settings.database_path) as conn:
+        rows = conn.execute(
+            f"""
+            select e.*, d.id as device_numeric_id,
+                   coalesce(e.user_id, d.user_id) as effective_user_id
+            from usage_events e
+            join devices d on d.device_id = e.device_id
+            where {where}
+            order by e.created_at desc, e.id desc{pagination}
+            """,
+            (*params, limit, offset) if limit is not None else params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def btf_usage_count(user_id: int, request: Request) -> int:
+    where, params = btf_usage_where(user_id, request)
+    with connect(settings.database_path) as conn:
+        row = conn.execute(
+            f"""
+            select count(*) as total
+            from usage_events e
+            join devices d on d.device_id = e.device_id
+            where {where}
+            """,
+            params,
+        ).fetchone()
+    return int(row["total"] or 0)
+
+
+def btf_usage_summary(user_id: int) -> dict[str, int]:
+    with connect(settings.database_path) as conn:
+        row = conn.execute(
+            """
+            select count(*) as requests,
+                   coalesce(sum(e.total_tokens), 0) as tokens,
+                   coalesce(sum(case when e.status_code < 400 then e.total_tokens else 0 end), 0) as successful_tokens
+            from usage_events e
+            join devices d on d.device_id = e.device_id
+            where coalesce(e.user_id, d.user_id) = ?
+            """,
+            (user_id,),
+        ).fetchone()
+    return {
+        "requests": int(row["requests"] or 0),
+        "tokens": int(row["tokens"] or 0),
+        "successful_tokens": int(row["successful_tokens"] or 0),
+    }
+
+
+def btf_account_summary(user_id: int) -> dict[str, int]:
+    usage = btf_usage_summary(user_id)
+    with connect(settings.database_path) as conn:
+        row = conn.execute(
+            """
+            select coalesce(sum(p.token_limit), 0) as token_budget,
+                   coalesce(sum((
+                       select sum(e.total_tokens)
+                       from usage_events e
+                       where e.device_id = d.device_id
+                         and e.status_code < 400
+                         and e.created_at >= coalesce(d.plan_started_at, d.created_at)
+                   )), 0) as current_tokens,
+                   coalesce(sum((
+                       select count(*)
+                       from usage_events e
+                       where e.device_id = d.device_id
+                         and e.status_code < 400
+                         and e.created_at >= coalesce(d.plan_started_at, d.created_at)
+                   )), 0) as current_requests
+            from devices d
+            join plans p on p.id = d.plan_id
+            where d.user_id = ?
+              and d.status = 'active'
+              and d.expires_at > ?
+            """,
+            (user_id, now_ts()),
+        ).fetchone()
+    token_budget = int(row["token_budget"] or 0)
+    current_tokens = int(row["current_tokens"] or 0)
+    return {
+        **usage,
+        "current_tokens": current_tokens,
+        "current_requests": int(row["current_requests"] or 0),
+        "quota": max(token_budget - current_tokens, 0),
+    }
+
+
+@app.get("/api/log/self")
+async def api_customer_usage_logs(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    dashboard_user = await resolve_dashboard_user(request, authorization)
+    try:
+        page = max(int(request.query_params.get("p") or 1), 1)
+    except ValueError:
+        page = 1
+    try:
+        page_size = max(min(int(request.query_params.get("page_size") or 20), 200), 1)
+    except ValueError:
+        page_size = 20
+    start = (page - 1) * page_size
+    # Paginate in SQL so a large history is not loaded into memory for a
+    # single page, while a separate count keeps the total stable.
+    events = btf_usage_events(
+        dashboard_user.id,
+        request,
+        limit=page_size,
+        offset=start,
+    )
+    items = [
+        btf_usage_log_row(row, dashboard_user.username)
+        for row in events
+    ]
+    return {
+        "success": True,
+        "message": "",
+        "data": {
+            "items": items,
+            "total": btf_usage_count(dashboard_user.id, request),
+            "page": page,
+            "page_size": page_size,
+        },
+    }
+
+
+@app.get("/api/log/self/stat")
+async def api_customer_usage_log_stats(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    dashboard_user = await resolve_dashboard_user(request, authorization)
+    events = btf_usage_events(dashboard_user.id, request, successful_only=True)
+    return {
+        "success": True,
+        "message": "",
+        "data": {
+            "quota": sum(int(row.get("total_tokens") or 0) for row in events),
+            "rpm": len(events),
+            "tpm": sum(int(row.get("total_tokens") or 0) for row in events),
+        },
+    }
+
+
+@app.get("/api/data/self")
+async def api_customer_usage_data(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    dashboard_user = await resolve_dashboard_user(request, authorization)
+    events = btf_usage_events(dashboard_user.id, request, successful_only=True)
+    grouped: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in events:
+        timestamp = int(row.get("created_at") or 0)
+        bucket = timestamp - timestamp % 3600
+        model = btf_usage_model(
+            str(row.get("path") or ""),
+            str(row.get("requested_model") or ""),
+            str(row.get("upstream_model") or ""),
+        )
+        key = (bucket, model)
+        item = grouped.setdefault(
+            key,
+            {
+                "user_id": dashboard_user.id,
+                "username": dashboard_user.username,
+                "model_name": model,
+                "created_at": bucket,
+                "token_used": 0,
+                "count": 0,
+                "quota": 0,
+            },
+        )
+        tokens = int(row.get("total_tokens") or 0)
+        item["token_used"] += tokens
+        item["quota"] += tokens
+        item["count"] += 1
+    return {"success": True, "message": "", "data": sorted(
+        grouped.values(), key=lambda item: (item["created_at"], item["model_name"])
+    )}
+
+
+@app.get("/api/data/flow/self")
+async def api_customer_usage_flow(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    dashboard_user = await resolve_dashboard_user(request, authorization)
+    events = btf_usage_events(dashboard_user.id, request, successful_only=True)
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in events:
+        device_id = str(row.get("device_id") or "")
+        model = btf_usage_model(
+            str(row.get("path") or ""),
+            str(row.get("requested_model") or ""),
+            str(row.get("upstream_model") or ""),
+        )
+        plan_id = str(row.get("plan_id") or "")
+        key = (device_id, plan_id, model)
+        item = grouped.setdefault(
+            key,
+            {
+                "user_id": dashboard_user.id,
+                "username": dashboard_user.username,
+                "node_name": "BTF Device Gateway",
+                "token_id": int(row.get("device_numeric_id") or 0),
+                "token_name": device_id,
+                "use_group": plan_id or device_id,
+                "channel_id": 0,
+                "channel_name": "",
+                "model_name": model,
+                "token_used": 0,
+                "count": 0,
+                "quota": 0,
+            },
+        )
+        tokens = int(row.get("total_tokens") or 0)
+        item["token_used"] += tokens
+        item["quota"] += tokens
+        item["count"] += 1
+    return {"success": True, "message": "", "data": sorted(
+        grouped.values(), key=lambda item: item["quota"], reverse=True
+    )}
 
 
 @app.get("/api/device/users/usage")
@@ -1824,6 +2231,40 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
     )
 
 
+def augment_customer_self_response(content: bytes, content_type: str) -> bytes:
+    if "application/json" not in content_type.lower():
+        return content
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except Exception:
+        return content
+    if not isinstance(payload, dict) or not payload.get("success"):
+        return content
+    user = payload.get("data")
+    if not isinstance(user, dict):
+        return content
+    try:
+        user_id = int(user.get("id") or 0)
+        role = int(user.get("role") or 0)
+    except (TypeError, ValueError):
+        return content
+    if user_id <= 0 or role >= ADMIN_ROLE:
+        return content
+
+    summary = btf_account_summary(user_id)
+    user["quota"] = summary["quota"]
+    user["used_quota"] = summary["current_tokens"]
+    user["request_count"] = summary["current_requests"]
+    user["btf_usage"] = {
+        "tokens": summary["tokens"],
+        "successful_tokens": summary["successful_tokens"],
+        "active_tokens": summary["current_tokens"],
+        "active_requests": summary["current_requests"],
+        "active_token_budget": max(summary["quota"] + summary["current_tokens"], 0),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def proxy_new_api(path: str, request: Request) -> Response:
     if request.method in {"GET", "HEAD"} and frontend_dist.exists():
@@ -1865,8 +2306,14 @@ async def proxy_new_api(path: str, request: Request) -> Response:
             params=request.query_params,
             headers=headers,
         )
+    content = upstream.content
+    if request.method == "GET" and path.strip("/") == "api/user/self" and upstream.status_code == 200:
+        content = augment_customer_self_response(
+            content,
+            upstream.headers.get("content-type", ""),
+        )
     return Response(
-        content=upstream.content,
+        content=content,
         status_code=upstream.status_code,
         headers=proxy_response_headers(upstream.headers),
         media_type=upstream.headers.get("content-type"),
