@@ -44,8 +44,13 @@ to shrink the repository or image, treat their removal as a separate, verified
 change rather than deleting them casually.
 
 A stray zero-byte `btf.db` used to sit in the repository root. It was never the
-gateway database (whose name is `btf-device-gateway.sqlite3`) and has been
-removed. `btf.db` is also listed in `.gitignore` to prevent it reappearing.
+gateway database (whose name is `btf-device-gateway.sqlite3` under `data/`) and
+has been deleted (verified absent as of the 2026-10-09 snapshot). Nothing writes
+to it: the gateway always derives its database path from `BTF_DATA_DIR`, and the
+test suite/CI point `BTF_DATA_DIR` at a temporary directory, so no runtime or
+test run recreates a database in the working directory. `btf.db` remains listed
+in `.gitignore` (and `.dockerignore`) only as a guard against a future accidental
+reappearance.
 
 ## Environment groups
 

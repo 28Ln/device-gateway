@@ -639,6 +639,11 @@ def test_existing_plan_defaults_are_forward_migrated_without_overwriting_custom_
     db = tmp_path / "test.sqlite3"
     init_db(db)
     with connect(db) as conn:
+        # Simulate a database created before the plan-model default migration
+        # ran: it still carries the legacy built-in defaults and has not
+        # recorded schema version 2. The migration is version-guarded so it
+        # runs once; a value the admin changes afterwards must never be
+        # rewritten by a later startup.
         conn.execute(
             "update plans set chat_models = ? where id = ?",
             ("deepseek-v4.1-flash", "day_1"),
@@ -651,6 +656,7 @@ def test_existing_plan_defaults_are_forward_migrated_without_overwriting_custom_
             "update plans set chat_models = ? where id = ?",
             ("my-custom-model", "week_1"),
         )
+        conn.execute("delete from schema_version where version = 2")
     init_db(db)
 
     with connect(db) as conn:

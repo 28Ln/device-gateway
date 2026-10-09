@@ -229,21 +229,14 @@ def _apply_data_migrations(conn: sqlite3.Connection) -> None:
         _record_migration(conn, version)
 
 
-def _apply_forward_migration(conn: sqlite3.Connection) -> None:
-    """Targeted, idempotent fix-ups that are cheap enough to re-check.
-
-    Unlike ``MIGRATIONS`` this is not version-gated: it only rewrites values
-    that still equal a previous built-in default, so re-running it is
-    idempotent and never touches administrator-customized plans.
-    """
-    _migration_legacy_plan_defaults(conn)
-
-
 def _migration_legacy_plan_defaults(conn: sqlite3.Connection) -> None:
     # Installations created before the GPT-5.5 chat model and the corrected
-    # image model carry the previous built-in defaults. Only rows whose value
-    # exactly equals the old built-in default are rewritten, so any plan an
-    # administrator customized is left untouched.
+    # image model carry the previous built-in defaults. This runs exactly once
+    # per database (guarded by ``schema_version`` in ``MIGRATIONS``): re-checking
+    # values on every startup would rewrite an administrator's deliberate
+    # choice, because a single-model value such as ``deepseek-v4.1-flash`` is
+    # indistinguishable from the old built-in default. Gating on the applied
+    # version means a value the admin later changes is never touched again.
     previous_chat_models = "deepseek-v4.1-flash"
     previous_image_models = "[b]gpt-image-2"
     for plan in DEFAULT_PLANS:
@@ -278,11 +271,22 @@ def _migration_backfill_usage_attribution(conn: sqlite3.Connection) -> None:
     _backfill_usage_attribution(conn)
 
 
+def _migration_plan_default_models(conn: sqlite3.Connection) -> None:
+    """One-time upgrade of legacy built-in plan model defaults.
+
+    Wrapped in its own version so it executes a single time per database; see
+    ``_migration_legacy_plan_defaults`` for why a re-runnable value check is
+    unsafe here.
+    """
+    _migration_legacy_plan_defaults(conn)
+
+
 # Version-guarded, run-once data migrations. Version numbers are an ordered
 # schema revision log; they are independent of the Python schema-generation
 # column patches (which are individually guarded by ``pragma table_info``).
 MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (1, _migration_backfill_usage_attribution),
+    (2, _migration_plan_default_models),
 ]
 
 
@@ -449,13 +453,13 @@ def init_db(database_path: Path) -> None:
                 ),
             )
 
-        # Ordered, version-guarded data migrations (idempotent, once per
-        # database) plus a cheap re-runnable forward migration. Fresh
+        # Ordered, version-guarded data migrations (once per database). Fresh
         # databases already hold the intended state via ``SCHEMA`` and the
-        # insert-or-ignore above, so both are no-ops there while upgrading
-        # legacy databases without overwriting administrator customizations.
+        # insert-or-ignore above, so each migration is a no-op there while a
+        # legacy database is upgraded without overwriting administrator
+        # customizations (a migration only ever runs for its own unapplied
+        # version).
         _apply_data_migrations(conn)
-        _apply_forward_migration(conn)
 
         conn.execute(
             """
