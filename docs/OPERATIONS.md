@@ -55,24 +55,18 @@ removed. `btf.db` is also listed in `.gitignore` to prevent it reappearing.
 PUBLIC_BASE_URL
 NEW_API_BASE_URL
 NEW_API_TOKEN
-```
-
 Only the variables above are read on the request path. Customer and admin
-requests are authenticated with the existing New API session, so no BTF-specific
-token or login is used.
-
-The following names are accepted by `app/config.py` but are currently **not used
-by any code path**; they are kept only for backward compatibility and do not need
-to be set:
-
-```text
-INTERNAL_ADMIN_TOKEN
-BTF_ADMIN_USERNAME
-BTF_ADMIN_PASSWORD
+requests are authenticated with the existing New API session; the gateway has
+no browser-facing admin credential of its own.
 ```
 
 `NEW_API_TOKEN` is the internal server-side relay token. It must not be given
 to a customer or hardware client.
+
+`PUBLIC_BASE_URL` defaults to the local placeholder `http://127.0.0.1:8080`.
+Production MUST set it to the public HTTPS domain (see "Real payment
+activation" below). The gateway has no separate admin username/password or
+internal admin token; administrative access is the existing New API session.
 
 ### Local payment test
 

@@ -183,9 +183,7 @@ BTF Gateway 依赖：
 - 客户不能拿到 `NEW_API_TOKEN`。
 - 客户浏览器使用 New API 的 Access Token / HttpOnly Refresh Cookie。
 - 设备 Key 和浏览器登录不是同一种凭据。
-- `INTERNAL_ADMIN_TOKEN`、`BTF_ADMIN_USERNAME`、`BTF_ADMIN_PASSWORD` 仍被
-  `app/config.py` 读取，但当前没有任何代码路径使用，属于历史遗留，不是必需配置。
-
+- 网关没有独立的 admin 密码/内部 admin token，管理操作复用 New API 会话。
 ## 4. 用户、设备和 MAC Key 模型
 
 ### 4.1 数据关系

@@ -1,9 +1,25 @@
 from __future__ import annotations
 
 import os
-import secrets
 from dataclasses import dataclass
 from pathlib import Path
+
+# Single source of truth for the public base URL default. This is a safe local
+# placeholder only; production MUST override it via the PUBLIC_BASE_URL env var.
+DEFAULT_PUBLIC_BASE_URL = "http://127.0.0.1:8080"
+
+
+def env_str(name: str, default: str = "") -> str:
+    """Return an env var, treating empty/whitespace-only values as unset.
+
+    An empty string must never override a caller-provided default, especially
+    for tokens and passwords where a blank value would silently weaken auth.
+    """
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    return value if value else default
 
 
 @dataclass(frozen=True)
@@ -14,10 +30,6 @@ class Settings:
     public_base_url: str
     new_api_base_url: str
     new_api_token: str
-    internal_admin_token: str
-    admin_username: str
-    admin_password: str
-    payment_instructions: str
     demo_payment_enabled: bool
     payment_notify_url: str
     mock_payment_secret: str
@@ -40,44 +52,36 @@ class Settings:
 
 
 def env_pem(name: str) -> str:
-    return os.getenv(name, "").replace("\\n", "\n").strip()
+    return env_str(name).replace("\\n", "\n").strip()
 
 
 def load_settings() -> Settings:
-    data_dir = Path(os.getenv("BTF_DATA_DIR", "./data")).resolve()
+    data_dir = Path(env_str("BTF_DATA_DIR", "./data")).resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
-    internal_admin_token = os.getenv("INTERNAL_ADMIN_TOKEN", secrets.token_urlsafe(32))
     return Settings(
         data_dir=data_dir,
         database_path=data_dir / "btf-device-gateway.sqlite3",
         generated_images_dir=data_dir / "generated-images",
-        public_base_url=os.getenv("PUBLIC_BASE_URL", "http://115.191.10.45").rstrip("/"),
-        new_api_base_url=os.getenv("NEW_API_BASE_URL", "http://127.0.0.1:3000").rstrip("/"),
-        new_api_token=os.getenv("NEW_API_TOKEN", ""),
-        internal_admin_token=internal_admin_token,
-        admin_username=os.getenv("BTF_ADMIN_USERNAME", "admin"),
-        admin_password=os.getenv("BTF_ADMIN_PASSWORD", internal_admin_token),
-        payment_instructions=os.getenv(
-            "PAYMENT_INSTRUCTIONS",
-            "请联系销售确认付款，订单确认后设备授权会自动延期。",
-        ),
-        demo_payment_enabled=os.getenv("DEMO_PAYMENT_ENABLED", "false").lower() in {"1", "true", "yes", "on"},
-        payment_notify_url=os.getenv("PAYMENT_NOTIFY_URL", "").rstrip("/"),
-        mock_payment_secret=os.getenv("MOCK_PAYMENT_SECRET", ""),
-        wechat_app_id=os.getenv("WECHAT_APP_ID", ""),
-        wechat_mch_id=os.getenv("WECHAT_MCH_ID", ""),
-        wechat_serial_no=os.getenv("WECHAT_SERIAL_NO", ""),
-        wechat_platform_serial_no=os.getenv("WECHAT_PLATFORM_SERIAL_NO", ""),
+        public_base_url=env_str("PUBLIC_BASE_URL", DEFAULT_PUBLIC_BASE_URL).rstrip("/"),
+        new_api_base_url=env_str("NEW_API_BASE_URL", "http://127.0.0.1:3000").rstrip("/"),
+        new_api_token=env_str("NEW_API_TOKEN"),
+        demo_payment_enabled=env_str("DEMO_PAYMENT_ENABLED", "false").lower() in {"1", "true", "yes", "on"},
+        payment_notify_url=env_str("PAYMENT_NOTIFY_URL").rstrip("/"),
+        mock_payment_secret=env_str("MOCK_PAYMENT_SECRET"),
+        wechat_app_id=env_str("WECHAT_APP_ID"),
+        wechat_mch_id=env_str("WECHAT_MCH_ID"),
+        wechat_serial_no=env_str("WECHAT_SERIAL_NO"),
+        wechat_platform_serial_no=env_str("WECHAT_PLATFORM_SERIAL_NO"),
         wechat_private_key=env_pem("WECHAT_PRIVATE_KEY"),
-        wechat_api_v3_key=os.getenv("WECHAT_API_V3_KEY", ""),
+        wechat_api_v3_key=env_str("WECHAT_API_V3_KEY"),
         wechat_platform_public_key=env_pem("WECHAT_PLATFORM_PUBLIC_KEY"),
-        wechat_api_base_url=os.getenv("WECHAT_API_BASE_URL", "https://api.mch.weixin.qq.com").rstrip("/"),
-        alipay_app_id=os.getenv("ALIPAY_APP_ID", ""),
+        wechat_api_base_url=env_str("WECHAT_API_BASE_URL", "https://api.mch.weixin.qq.com").rstrip("/"),
+        alipay_app_id=env_str("ALIPAY_APP_ID"),
         alipay_private_key=env_pem("ALIPAY_PRIVATE_KEY"),
         alipay_public_key=env_pem("ALIPAY_PUBLIC_KEY"),
-        alipay_gateway=os.getenv("ALIPAY_GATEWAY", "https://openapi.alipay.com/gateway.do"),
-        chat_prompt_cost_per_million=float(os.getenv("BTF_CHAT_PROMPT_COST_PER_MILLION", "0") or 0),
-        chat_completion_cost_per_million=float(os.getenv("BTF_CHAT_COMPLETION_COST_PER_MILLION", "0") or 0),
-        image_cost_per_request=float(os.getenv("BTF_IMAGE_COST_PER_REQUEST", "0") or 0),
-        order_expires_seconds=int(os.getenv("BTF_ORDER_EXPIRES_SECONDS", "86400") or 86400),
+        alipay_gateway=env_str("ALIPAY_GATEWAY", "https://openapi.alipay.com/gateway.do"),
+        chat_prompt_cost_per_million=float(env_str("BTF_CHAT_PROMPT_COST_PER_MILLION", "0") or 0),
+        chat_completion_cost_per_million=float(env_str("BTF_CHAT_COMPLETION_COST_PER_MILLION", "0") or 0),
+        image_cost_per_request=float(env_str("BTF_IMAGE_COST_PER_REQUEST", "0") or 0),
+        order_expires_seconds=int(env_str("BTF_ORDER_EXPIRES_SECONDS", "86400") or 86400),
     )

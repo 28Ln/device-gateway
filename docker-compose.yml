@@ -3,15 +3,22 @@ services:
     build: .
     container_name: btf-device-gateway
     restart: unless-stopped
+    # Secrets such as NEW_API_TOKEN, MOCK_PAYMENT_SECRET and provider keys are
+    # read from .env when present. Variables absent from .env are NOT injected,
+    # so application defaults remain in effect. `environment` below overrides
+    # env_file entries when both define the same key.
+    env_file:
+      - path: .env
+        required: false
     environment:
       BTF_DATA_DIR: /data
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://115.191.10.45}
+      # Production MUST set this to the public HTTPS domain.
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:8080}
       NEW_API_BASE_URL: ${NEW_API_BASE_URL:-http://new-api:3000}
-      NEW_API_TOKEN: ${NEW_API_TOKEN}
-      INTERNAL_ADMIN_TOKEN: ${INTERNAL_ADMIN_TOKEN}
-      BTF_ADMIN_USERNAME: ${BTF_ADMIN_USERNAME:-admin}
-      BTF_ADMIN_PASSWORD: ${BTF_ADMIN_PASSWORD}
-      PAYMENT_INSTRUCTIONS: ${PAYMENT_INSTRUCTIONS:-请联系销售确认付款，订单确认后设备授权会自动延期。}
+      # NEW_API_TOKEN is intentionally not listed here. Docker Compose injects an
+      # empty string for an unset substitution without a default value, which
+      # would override any application-level fallback. It is passed via env_file
+      # so an unset value stays truly unset.
       DEMO_PAYMENT_ENABLED: ${DEMO_PAYMENT_ENABLED:-false}
       MOCK_PAYMENT_SECRET: ${MOCK_PAYMENT_SECRET:-}
       PAYMENT_NOTIFY_URL: ${PAYMENT_NOTIFY_URL:-}
