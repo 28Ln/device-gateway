@@ -40,7 +40,7 @@ New API 用户账号
 - 用户只能看到自己绑定的设备、订单、用量和图片。
 - 管理员可以查看和管理全部设备。
 - 客户用量兼容 New API 原有日志、统计和图表接口。
-- 全量 Python 测试 `49 passed`（截至本次快照）。
+- 全量 Python 测试见测试套件（快照日期 2026-10-09 时为 `224+ passed`）。不要在本文件硬编码精确测试数量，避免再次漂移。
 
 尚未完成或需要外部资料才能完成：
 
@@ -149,15 +149,10 @@ BTF Gateway 依赖：
 
 - 分支：`master`
 - 没有配置 Git remote。
-- 工作区存在未提交修改，不能执行 `git reset --hard` 或覆盖这些修改。
-- 当前 HEAD：`36f88bb Fix btf-chat alias default, migrate plan models, paginate usage logs`
-- 近期关键提交：
-  - `825a11c Hide internal device plan limits from customers`
-  - `4c2b5bf Add user-level device usage controls`
-  - `4e42f86 Add device order close and expiry flow`
-  - `d964694 Persist generated device images`
-  - `05eed53 Add generated image listing API`
-  - `36f88bb Fix btf-chat alias default, migrate plan models, paginate usage logs`
+- 工作区可能包含未提交修改，不能执行 `git reset --hard` 或覆盖这些修改。
+- HEAD 会随时间推移；交接时以实际 `git log` 为准。快照日期 2026-10-09 时为
+  `58407ae fix integration image test for signed-URL gate (w12 x w15)`。
+- 近期关键提交以 `git log --oneline` 为准，不要依赖本文件里固定的哈希列表。
 - 本文档 `docs/CLAUDE_HANDOFF.md` 是版本库中的既有文件，交接时应随代码一起保留。
 
 ## 3. 系统所有权边界
@@ -418,7 +413,11 @@ btf-image -> [b2]gpt-image-2
     -> /device-images/YYYYMMDD/filename.png
 ```
 
-图片目录不开放列表，只允许知道完整路径后访问。
+图片目录不开放列表；`/device-images/...` 不再"知道路径即可访问"。每次生成的图片
+链接都带一个绑定到该路径的 HMAC 签名和过期时间（`exp`/`sig` 查询参数），签名失配、
+被篡改或过期一律返回 403，因此仅猜到完整路径无法读取图片。链接默认 24 小时有效
+（`BTF_IMAGE_URL_TTL_SECONDS`，最小 60 秒），签名密钥由 `BTF_IMAGE_URL_SIGNING_KEY`
+或数据目录内自动生成并持久化的密钥提供。
 
 图片历史中曾经存在旧的 `[b]gpt-image-2` 失败记录；当前 New API 渠道、abilities 和 BTF 套餐已经统一到 `[b2]gpt-image-2`，旧模型已禁用。
 
@@ -511,7 +510,8 @@ Android / 硬件
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/health` | 服务健康检查 |
+| GET | `/health` | 服务健康检查（仅存活检查，无 I/O） |
+| GET | `/ready` | 深度就绪检查（数据库 `SELECT 1` + 上游探测），失败返回 503 |
 | GET | `/api/status` | New API 状态 |
 | GET | `/api/device/plans` | 套餐列表 |
 | GET | `/api/device/payment-providers` | 当前配置的支付提供商 |
@@ -523,7 +523,7 @@ Android / 硬件
 | POST | `/api/device/payments/alipay/notify` | 支付宝回调 |
 | POST | `/api/device/payments/mock/complete/{id}` | Mock 完成，仅测试环境 |
 | GET/POST | `/v1/*` | OpenAI 兼容设备 API |
-| GET | `/device-images/{path}` | 读取已落盘图片 |
+| GET | `/device-images/{path}` | 读取已落盘图片，需带有效签名的短期链接 |
 
 ### 9.2 管理和客户 Dashboard API
 
@@ -634,10 +634,10 @@ data.items = []
 
 ### 12.1 自动化测试
 
-当前全量测试：
+当前全量测试（不要硬编码精确数量，以下为快照日期 2026-10-09 的结果）：
 
 ```text
-49 passed, 1 warning
+224+ passed
 ```
 
 覆盖：
@@ -702,10 +702,10 @@ docker run --rm \
 /api/device/payment-providers   200, items=[]
 ```
 
-本次在 Docker 测试环境重新运行：
+本次在 Docker 测试环境重新运行（快照日期 2026-10-09，数量以测试套件为准）：
 
 ```text
-49 passed, 1 warning
+224+ passed
 ```
 
 宿主机 `/opt/btf-device-gateway` 的系统 Python 没有安装 pytest，因此测试使用
