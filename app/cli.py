@@ -250,6 +250,10 @@ def cmd_disable_device(args: argparse.Namespace) -> None:
 def cmd_enable_device(args: argparse.Namespace) -> None:
     settings = load_settings()
     ensure_ready(settings.database_path)
+    if args.days_if_expired <= 0:
+        # Reject early so the user gets a CLI-specific hint instead of a value
+        # error bubbling out of the service, and so we never write a past expiry.
+        raise ValueError("--days-if-expired must be greater than 0")
     print_device(enable_device(settings.database_path, args.device_id, args.days_if_expired))
 
 
@@ -391,7 +395,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     enable = sub.add_parser("enable-device")
     enable.add_argument("device_id")
-    enable.add_argument("--days-if-expired", type=int, default=30)
+    enable.add_argument(
+        "--days-if-expired",
+        type=int,
+        default=30,
+        help="renewal window in days applied when the device has already expired (must be > 0)",
+    )
     enable.set_defaults(func=cmd_enable_device)
 
     approve = sub.add_parser("approve-order")

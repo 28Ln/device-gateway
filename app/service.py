@@ -385,10 +385,25 @@ def disable_device(database_path: Path, device_id: str) -> dict:
 
 
 def enable_device(database_path: Path, device_id: str, days_if_expired: int = 30) -> dict:
+    """Re-activate a device, mirroring the HTTP ``action=enable`` semantics.
+
+    Enabling must never produce -- or leave behind -- a device that is both
+    ``active`` and already ``expired``. A negative/zero ``days_if_expired``
+    would do exactly that by writing a past ``expires_at``, so it is rejected
+    outright (ValueError). An already-expired device therefore only becomes
+    ``active`` when an explicit positive renewal window is supplied; without
+    one the call fails and leaves the row untouched (non-active), which is the
+    same "expiry wins" normalisation the HTTP ``action=enable`` path applies.
+    """
+    if days_if_expired <= 0:
+        raise ValueError("days_if_expired must be greater than 0")
     device = get_device(database_path, device_id)
     ts = now_ts()
     expires_at = device["expires_at"]
     if expires_at <= ts:
+        # A lapsed device needs an explicit positive renewal window; extending
+        # from "now" (not from the stale expiry) keeps the new expiry future-dated,
+        # so the row can safely become ``active`` instead of active+expired.
         expires_at = ts + days_if_expired * 86400
     with connect(database_path) as conn:
         conn.execute(
