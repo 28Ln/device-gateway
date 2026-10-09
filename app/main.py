@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import secrets
+import time
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,6 +75,17 @@ BTF_IMAGE_ALIAS = "btf-image"
 ACTIVE_REQUESTS: dict[str, int] = {}
 ACTIVE_USER_REQUESTS: dict[int, int] = {}
 MAX_GENERATED_IMAGE_BYTES = 25 * 1024 * 1024
+# Upper bound for a device/plan expiry (~100 years) so a typo such as an
+# unusually large epoch cannot produce a nonsensical "forever" licence.
+MAX_EXPIRES_AT = 4_102_444_800
+MAX_PAGE_SIZE = 200
+MAX_PAGE = 1_000_000
+DEVICE_STATUSES = ("active", "disabled", "expired")
+# Cache the expensive device authentication so the /v1/models early path does
+# not double-verify the key on every request. Entries expire quickly, so device
+# disable/expiry still takes effect within the TTL.
+DEVICE_AUTH_CACHE: dict[tuple[str, str], tuple[float, "Any"]] = {}
+DEVICE_AUTH_CACHE_TTL = 15.0
 
 
 @dataclass(frozen=True)
@@ -557,9 +569,12 @@ def enforce_plan_access(device_id: str, path: str, method: str, body: bytes) -> 
         return body
     plan = plan_entitlements_for_device(device_id)
     first = path.split("/", 1)[0]
+    # Model discovery is an authenticated endpoint too: it must honour the
+    # same quota/rate limits as inference requests instead of short-circuiting
+    # before the limit checks.
+    enforce_plan_limits(device_id, first, plan)
     if first == "models":
         return body
-    enforce_plan_limits(device_id, first, plan)
     model = request_model_from_body(body)
     if not model:
         raise HTTPException(status_code=400, detail="model is required")
@@ -816,9 +831,30 @@ def mask_bind_code(value: str) -> str:
     return f"****{value[-4:]}"
 
 
+def int_or_400(value: Any, field: str) -> int:
+    """Parse an integer payload field, rejecting malformed input with 400."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid {field}") from exc
+
+
 def optional_user_id(value: Any) -> int | None:
-    user_id = int(value or 0)
+    user_id = int_or_400(value, "user_id")
     return user_id if user_id > 0 else None
+
+
+def positive_expires_at(value: Any, field: str = "expires_at") -> int:
+    """Parse and bound a required expiry timestamp.
+
+    Rejects non-numeric input with 400 and out-of-range values (``0``,
+    negatives, or absurdly large epochs) so a device can never end up stored
+    with an already-invalid expiry.
+    """
+    expires_at = int_or_400(value, field)
+    if expires_at <= 0 or expires_at > MAX_EXPIRES_AT:
+        raise HTTPException(status_code=400, detail=f"invalid {field}")
+    return expires_at
 
 
 def split_macs(value: Any) -> list[str]:
@@ -845,12 +881,26 @@ def compose_note(name: str, plan: str, remark: str) -> str:
     return name or plan
 
 
-def device_row_to_new_api(row: dict[str, Any]) -> dict[str, Any]:
-    note = row.get("note") or ""
-    name = note
-    plan = ""
+def device_display_fields(note: str) -> tuple[str, str]:
+    note = note or ""
     if " / " in note:
         name, plan = note.split(" / ", 1)
+        return name, plan
+    return note, ""
+
+
+def device_effective_status(status: str, expires_at: int, now: int) -> str:
+    if status == "active" and int(expires_at or 0) <= now:
+        return "expired"
+    return status
+
+
+def device_row_to_new_api(row: dict[str, Any], now: int | None = None) -> dict[str, Any]:
+    note = row.get("note") or ""
+    name, plan = device_display_fields(note)
+    if now is None:
+        now = now_ts()
+    status = str(row.get("status") or "")
     return {
         "id": row["id"],
         "user_id": row.get("user_id") or 0,
@@ -863,7 +913,7 @@ def device_row_to_new_api(row: dict[str, Any]) -> dict[str, Any]:
         "allow_image": bool(row.get("allow_image") or 0),
         "bind_code_mask": row.get("bind_code_mask") or "",
         "bound_at": row.get("bound_at") or 0,
-        "status": row["status"],
+        "status": device_effective_status(status, row.get("expires_at") or 0, now),
         "expires_at": row["expires_at"],
         "last_seen_at": row.get("last_seen_at") or 0,
         "request_count": row["request_count"],
@@ -876,12 +926,43 @@ def device_row_to_new_api(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def new_api_page(items: list[dict[str, Any]], page: int, page_size: int) -> dict[str, Any]:
-    start = max(page - 1, 0) * page_size
-    end = start + page_size
+def clamp_page_bounds(p: int, page_size: int) -> tuple[int, int]:
+    """Validate pagination bounds, rejecting illegal values with HTTP 400."""
+    if p < 1 or p > MAX_PAGE:
+        raise HTTPException(status_code=400, detail="invalid page")
+    if page_size < 1 or page_size > MAX_PAGE_SIZE:
+        raise HTTPException(status_code=400, detail="invalid page_size")
+    return p, page_size
+
+
+def normalized_device_statuses(status: str) -> list[str]:
+    """Split a status filter into known statuses, rejecting unknown ones.
+
+    ``expired`` is virtual: it is derived from ``expires_at`` rather than the
+    stored status column, so it maps to an extra SQL predicate.
+    """
+    requested = [part.strip() for part in str(status or "").split(",") if part.strip()]
+    if not requested:
+        return []
+    unknown = [value for value in requested if value not in DEVICE_STATUSES]
+    if unknown:
+        raise HTTPException(status_code=400, detail="invalid status")
+    return list(dict.fromkeys(requested))
+
+
+def new_api_page(items: list[dict[str, Any]], page: int, page_size: int, total: int | None = None) -> dict[str, Any]:
+    """Build a page envelope.
+
+    When ``total`` is provided the caller has already paginated (e.g. in SQL)
+    and ``items`` is the page itself, so it is not sliced again.
+    """
+    if total is None:
+        start = max(page - 1, 0) * page_size
+        items = items[start:start + page_size]
+        total = len(items)
     return {
-        "items": items[start:end],
-        "total": len(items),
+        "items": items,
+        "total": int(total),
         "page": page,
         "page_size": page_size,
     }
@@ -900,51 +981,80 @@ async def api_list_devices(
     page_size: int = 20,
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
+    p, page_size = clamp_page_bounds(p, page_size)
+    statuses = normalized_device_statuses(status)
     where: list[str] = []
     params: list[Any] = []
     if not dashboard_user.is_admin:
         where.append("d.user_id = ?")
         params.append(dashboard_user.id)
-    query = """
-        select d.*, u.username as owner_username, u.display_name as owner_display_name,
-               p.title as plan_title, p.allow_deepseek, p.allow_image
-        from devices d
-        left join users u on u.id = d.user_id
-        left join plans p on p.id = d.plan_id
-    """
-    if where:
-        query += " where " + " and ".join(where)
-    query += " order by d.id desc"
-    with connect(settings.database_path) as conn:
-        rows = [dict(row) for row in conn.execute(query, params).fetchall()]
-    items = [device_row_to_new_api(row) for row in rows]
     if dashboard_user.is_admin and user_id > 0:
-        items = [item for item in items if item["user_id"] == user_id]
-    if status:
-        items = [item for item in items if item["status"] == status]
+        where.append("d.user_id = ?")
+        params.append(user_id)
+    if statuses:
+        clauses: list[str] = []
+        stored = [value for value in statuses if value != "expired"]
+        if stored:
+            placeholders = ", ".join("?" for _ in stored)
+            clauses.append(f"d.status in ({placeholders})")
+            params.extend(stored)
+        if "expired" in statuses:
+            clauses.append("d.status = 'active' and d.expires_at <= ?")
+            params.append(now_ts())
+        where.append("(" + " or ".join(clauses) + ")")
     if keyword:
-        needle = keyword.lower()
-        items = [
-            item
-            for item in items
-            if needle in item["mac"].lower()
-            or needle in item["name"].lower()
-            or needle in item["username"].lower()
-            or needle in item["remark"].lower()
-        ]
+        needle = f"%{keyword.lower()}%"
+        where.append(
+            "(lower(d.device_id) like ? or lower(coalesce(d.note, '')) like ?"
+            " or lower(coalesce(u.username, '')) like ?"
+            " or lower(coalesce(u.display_name, '')) like ?)"
+        )
+        params.extend([needle, needle, needle, needle])
     sort_fields = {
-        "id",
-        "mac",
-        "user_id",
-        "status",
-        "expires_at",
-        "last_seen_at",
-        "request_count",
-        "created_at",
+        "id": "d.id",
+        "mac": "d.device_id",
+        "user_id": "d.user_id",
+        "status": "d.status",
+        "expires_at": "d.expires_at",
+        "last_seen_at": "d.last_seen_at",
+        "request_count": "d.request_count",
+        "created_at": "d.created_at",
     }
-    if sort_by in sort_fields:
-        items.sort(key=lambda item: item.get(sort_by) or 0, reverse=sort_order != "asc")
-    return {"success": True, "message": "", "data": new_api_page(items, p, page_size)}
+    sort_column = sort_fields.get(sort_by, "d.id")
+    direction = "asc" if str(sort_order).lower() == "asc" else "desc"
+    where_sql = (" where " + " and ".join(where)) if where else ""
+    offset = (p - 1) * page_size
+    with connect(settings.database_path) as conn:
+        total = int(
+            conn.execute(
+                f"""
+                select count(*)
+                from devices d
+                left join users u on u.id = d.user_id
+                {where_sql}
+                """,
+                params,
+            ).fetchone()[0]
+            or 0
+        )
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                select d.*, u.username as owner_username, u.display_name as owner_display_name,
+                       p.title as plan_title, p.allow_deepseek, p.allow_image
+                from devices d
+                left join users u on u.id = d.user_id
+                left join plans p on p.id = d.plan_id
+                {where_sql}
+                order by {sort_column} {direction}, d.id desc
+                limit ? offset ?
+                """,
+                (*params, page_size, offset),
+            ).fetchall()
+        ]
+    items = [device_row_to_new_api(row) for row in rows]
+    return {"success": True, "message": "", "data": new_api_page(items, p, page_size, total)}
 
 
 @app.post("/api/device/")
@@ -957,7 +1067,7 @@ async def api_create_device(
     payload = await request.json()
     user_id = optional_user_id(payload.get("user_id"))
     mac = normalize_mac(payload.get("mac"))
-    expires_at = int(payload.get("expires_at") or 0)
+    expires_at = int_or_400(payload.get("expires_at"), "expires_at")
     status = str(payload.get("status") or "active").strip() or "active"
     plan_id = plan_id_from_text(str(payload.get("plan_id") or payload.get("plan") or "day_1"))
     bind_code = normalize_bind_code(payload.get("bind_code"))
@@ -967,12 +1077,16 @@ async def api_create_device(
         return {"success": False, "message": "invalid params"}
     if status not in {"active", "disabled"}:
         return {"success": False, "message": "invalid status"}
+    ts = now_ts()
+    if status == "active":
+        expires_at = positive_expires_at(payload.get("expires_at"), "expires_at")
+        if expires_at <= ts:
+            return {"success": False, "message": "expires_at must be in the future for an active device"}
     note = compose_note(
         str(payload.get("name") or ""),
         str(payload.get("plan") or ""),
         str(payload.get("remark") or ""),
     )
-    ts = now_ts()
     with connect(settings.database_path) as conn:
         if user_id is not None:
             user = conn.execute("select id from users where id = ?", (user_id,)).fetchone()
@@ -1025,10 +1139,10 @@ async def api_update_device(
     dashboard_user = await resolve_dashboard_user(request, authorization)
     require_admin(dashboard_user)
     payload = await request.json()
-    device_id = int(payload.get("id") or 0)
+    device_id = int_or_400(payload.get("id"), "id")
     user_id = optional_user_id(payload.get("user_id"))
     mac = normalize_mac(payload.get("mac"))
-    expires_at = int(payload.get("expires_at") or 0)
+    expires_at = int_or_400(payload.get("expires_at"), "expires_at")
     status = str(payload.get("status") or "active").strip() or "active"
     plan_id = plan_id_from_text(str(payload.get("plan_id") or payload.get("plan") or "day_1"))
     bind_code = normalize_bind_code(payload.get("bind_code"))
@@ -1042,6 +1156,10 @@ async def api_update_device(
         str(payload.get("remark") or ""),
     )
     ts = now_ts()
+    if status == "active":
+        expires_at = positive_expires_at(payload.get("expires_at"), "expires_at")
+        if expires_at <= ts:
+            return {"success": False, "message": "expires_at must be in the future for an active device"}
     with connect(settings.database_path) as conn:
         if user_id is not None:
             user = conn.execute("select id from users where id = ?", (user_id,)).fetchone()
@@ -1102,7 +1220,7 @@ async def api_batch_create_devices(
     payload = await request.json()
     user_id = optional_user_id(payload.get("user_id"))
     macs = split_macs(payload.get("macs"))
-    expires_at = int(payload.get("expires_at") or 0)
+    expires_at = int_or_400(payload.get("expires_at"), "expires_at")
     plan = str(payload.get("plan") or "")
     plan_id = plan_id_from_text(str(payload.get("plan_id") or plan or "day_1"))
     remark = str(payload.get("remark") or "")
@@ -1111,8 +1229,12 @@ async def api_batch_create_devices(
     if not macs or not expires_at:
         return {"success": False, "message": "invalid params"}
     ts = now_ts()
+    expires_at = positive_expires_at(payload.get("expires_at"), "expires_at")
+    if expires_at <= ts:
+        return {"success": False, "message": "expires_at must be in the future"}
     created = 0
     failed: list[str] = []
+    failures: list[dict[str, str]] = []
     bind_codes: dict[str, str] = {}
     with connect(settings.database_path) as conn:
         if user_id is not None:
@@ -1154,9 +1276,21 @@ async def api_batch_create_devices(
                 created += 1
                 if row_bind_code:
                     bind_codes[mac] = row_bind_code
-            except Exception:
+            except Exception as exc:
+                # Keep the real per-device failure instead of silently
+                # reporting success for rejected inserts.
                 failed.append(mac)
-    return {"success": True, "message": "", "data": {"created": created, "failed": failed, "bind_codes": bind_codes}}
+                failures.append({"mac": mac, "message": str(exc)})
+    return {
+        "success": created > 0,
+        "message": "" if not failures else "some devices could not be created",
+        "data": {
+            "created": created,
+            "failed": failed,
+            "failures": failures,
+            "bind_codes": bind_codes,
+        },
+    }
 
 
 @app.post("/api/device/bind")
@@ -1201,19 +1335,22 @@ async def api_manage_device(
     dashboard_user = await resolve_dashboard_user(request, authorization)
     require_admin(dashboard_user)
     payload = await request.json()
-    device_id = int(payload.get("id") or 0)
+    device_id = int_or_400(payload.get("id"), "id")
     action = payload.get("action")
-    expires_at = int(payload.get("expires_at") or 0)
+    expires_at = int_or_400(payload.get("expires_at"), "expires_at")
     ts = now_ts()
     with connect(settings.database_path) as conn:
-        row = conn.execute("select device_id from devices where id = ?", (device_id,)).fetchone()
+        row = conn.execute("select device_id, status from devices where id = ?", (device_id,)).fetchone()
         if not row:
             return {"success": False, "message": "device not found"}
         if action == "enable":
             conn.execute("update devices set status = 'active', updated_at = ? where id = ?", (ts, device_id))
         elif action == "disable":
             conn.execute("update devices set status = 'disabled', updated_at = ? where id = ?", (ts, device_id))
-        elif action == "renew" and expires_at > 0:
+        elif action == "renew":
+            expires_at = positive_expires_at(payload.get("expires_at"), "expires_at")
+            if expires_at <= ts:
+                return {"success": False, "message": "expires_at must be in the future"}
             conn.execute(
                 "update devices set expires_at = ?, status = 'active', updated_at = ?, plan_started_at = ? where id = ?",
                 (expires_at, ts, ts, device_id),
@@ -1302,7 +1439,7 @@ async def api_update_device_plan(
         }
         for field in limit_fields:
             if field in payload:
-                limit_fields[field] = max(int(payload.get(field) or 0), 0)
+                limit_fields[field] = max(int_or_400(payload.get(field), field), 0)
         chat_alias = str(payload.get("chat_alias") if "chat_alias" in payload else current.get("chat_alias") or BTF_CHAT_ALIAS).strip() or BTF_CHAT_ALIAS
         image_alias = str(payload.get("image_alias") if "image_alias" in payload else current.get("image_alias") or BTF_IMAGE_ALIAS).strip() or BTF_IMAGE_ALIAS
         conn.execute(
@@ -1634,9 +1771,40 @@ def btf_usage_where(
     elif log_type == 5:
         conditions.append("e.status_code >= 400")
     elif log_type not in {0, 2, 5}:
+        # This gateway only has consumption (2) and error (5) log types.
+        # New API's "Top-up"/recharge type has no backing data here, so it is
+        # explicitly unsupported and returns an empty page instead of
+        # silently matching unrelated rows.
         conditions.append("1 = 0")
 
     return " and ".join(conditions), params
+
+
+def btf_usage_window_stats(user_id: int, window_seconds: int = 60) -> dict[str, int]:
+    """Aggregate a customer's successful requests over a recent time window.
+
+    Used for rate-style statistics (rpm/tpm) so they reflect the last
+    ``window_seconds`` rather than all-time totals.
+    """
+    now = now_ts()
+    window_start = now - max(int(window_seconds), 0)
+    with connect(settings.database_path) as conn:
+        row = conn.execute(
+            """
+            select count(*) as requests,
+                   coalesce(sum(e.total_tokens), 0) as tokens
+            from usage_events e
+            join devices d on d.device_id = e.device_id
+            where coalesce(e.user_id, d.user_id) = ?
+              and e.created_at >= ?
+              and e.created_at <= ?
+              and e.status_code < 400
+            """,
+            (user_id, window_start, now),
+        ).fetchone()
+    requests = int(row["requests"] or 0)
+    tokens = int(row["tokens"] or 0)
+    return {"rpm": requests, "tpm": tokens}
 
 
 def btf_usage_model(path: str, requested_model: str, upstream_model: str) -> str:
@@ -1837,14 +2005,18 @@ async def api_customer_usage_log_stats(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
+    # ``quota`` is the lifetime successful-token total; ``rpm``/``tpm`` are the
+    # requests and tokens observed in the last 60 seconds (matching New API's
+    # rate semantics) rather than an all-time aggregate.
+    window = btf_usage_window_stats(dashboard_user.id, 60)
     events = btf_usage_events(dashboard_user.id, request, successful_only=True)
     return {
         "success": True,
         "message": "",
         "data": {
             "quota": sum(int(row.get("total_tokens") or 0) for row in events),
-            "rpm": len(events),
-            "tpm": sum(int(row.get("total_tokens") or 0) for row in events),
+            "rpm": window["rpm"],
+            "tpm": window["tpm"],
         },
     }
 
@@ -1963,7 +2135,7 @@ async def api_update_device_user_limits(
             return {"success": False, "message": "user not found"}
         current = dict(row)
         values = {
-            field: max(int(payload.get(field, current.get(field) or default) or 0), 0)
+            field: max(int_or_400(payload.get(field, current.get(field) or default), field), 0)
             for field, default in fields.items()
         }
         conn.execute(
@@ -2134,6 +2306,27 @@ def upstream_proxy_headers(request: Request) -> dict[str, str]:
     return headers
 
 
+def cached_device_auth(device_key: str) -> "Any":
+    """Authenticate a device key, caching the result briefly.
+
+    The /v1/models path used to authenticate, early-return, then authenticate
+    again; caching keeps that flow cheap while still rejecting disabled or
+    expired devices within the (short) TTL.
+    """
+    now = time.monotonic()
+    cache_key = (str(settings.database_path), device_key)
+    cached = DEVICE_AUTH_CACHE.get(cache_key)
+    if cached and cached[0] > now:
+        return cached[1]
+    auth = authenticate_device(settings.database_path, device_key)
+    if len(DEVICE_AUTH_CACHE) >= 4096:
+        # Bound memory: drop entries whose TTL has elapsed before inserting.
+        for key in [k for k, (expiry, _) in DEVICE_AUTH_CACHE.items() if expiry <= now]:
+            DEVICE_AUTH_CACHE.pop(key, None)
+    DEVICE_AUTH_CACHE[cache_key] = (now + DEVICE_AUTH_CACHE_TTL, auth)
+    return auth
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def proxy_v1(path: str, request: Request, authorization: str | None = Header(default=None)) -> Response:
     if not settings.new_api_token:
@@ -2141,7 +2334,7 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
     clean_path = clean_v1_proxy_path(path)
     if clean_path is None:
         raise HTTPException(status_code=404, detail="not found")
-    auth = authenticate_device(settings.database_path, bearer_token(authorization))
+    auth = cached_device_auth(bearer_token(authorization))
     body = await request.body()
     original_body = body
     requested_model = request_model_from_body(body)
