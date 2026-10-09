@@ -87,7 +87,8 @@ Repeated provider callbacks do not extend twice.
 
 | Endpoint | Purpose | Credential |
 | --- | --- | --- |
-| `GET /health` | Gateway health | None |
+| `GET /health` | Gateway health (liveness only) | None |
+| `GET /ready` | Deep readiness (DB `SELECT 1` + upstream probe); 503 on failure | None |
 | `GET /api/status` | New API status | None |
 | `GET /api/device/plans` | Enabled device plans | None |
 | `GET /api/device/payment-providers` | Configured real/mock providers | None |

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -9,6 +10,7 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import tempfile
 import time
 from collections.abc import AsyncIterator, Callable
@@ -153,6 +155,8 @@ def stream_client() -> httpx.AsyncClient:
 MAX_IMAGE_REDIRECTS = 3
 IMAGE_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 IMAGE_DOWNLOAD_ALLOWED_SCHEMES = {"http", "https"}
+# Readiness must fail fast: a slow upstream should not wedge the probe.
+READY_UPSTREAM_TIMEOUT = 2.0
 logger = logging.getLogger("btf_device_gateway")
 
 
@@ -841,8 +845,89 @@ def image_extension(content_type: str, data: bytes) -> str:
     return ".png"
 
 
-def generated_image_public_url(relative_path: str) -> str:
-    return f"{settings.public_base_url}/device-images/{relative_path}"
+# --- generated image access control ----------------------------------------
+# Two independent barriers stop cross-user image enumeration:
+#   1. Every filename carries a >=256-bit random segment (below), so a path can
+#      never be guessed; but a public URL would otherwise leak that capability.
+#   2. Reading a file therefore requires a short-lived HMAC query signature
+#      (``?exp=..&sig=..``) bound to the exact path. Unsigned, tampered or
+#      expired links are refused, so a pasted/shared URL stops working and the
+#      dashboard re-signs stored rows on the fly for their owner.
+# This "signed URL" scheme (rather than a dashboard-session requirement) was
+# chosen because it keeps the hardware path working: a device fetches the image
+# with the URL straight from its own API response, with no extra credentials.
+_GENERATED_IMAGE_PATH_RE = re.compile(
+    r"^\d{8}/\d{10}-(?P<data>[A-Za-z0-9_\-]{24,})-\d+-[0-9a-f]{16}\.(?:png|jpg|webp|gif)$"
+)
+IMAGE_SIGNATURE_PARAM = "sig"
+IMAGE_EXPIRES_PARAM = "exp"
+# Signed URLs are capability URLs: keep client caching short and private so a
+# served copy cannot outlive the signature by much and never lands in a shared
+# cache.
+IMAGE_CACHE_CONTROL = "private, max-age=60"
+
+
+def generate_image_data_segment() -> str:
+    """Return a >=256-bit URL-safe random segment for a generated filename."""
+    return secrets.token_urlsafe(32)
+
+
+def generated_image_data_segment(relative_path: str) -> str | None:
+    match = _GENERATED_IMAGE_PATH_RE.match(relative_path)
+    return match.group("data") if match else None
+
+
+def image_url_signature(relative_path: str, expires_at: int) -> str:
+    message = f"{relative_path}\n{expires_at}".encode("utf-8")
+    digest = hmac.new(
+        settings.image_url_signing_key.encode("utf-8"), message, hashlib.sha256
+    ).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def verify_image_signature(relative_path: str, expires_at: int, signature: str) -> bool:
+    if expires_at <= now_ts():
+        return False
+    expected = image_url_signature(relative_path, expires_at)
+    return hmac.compare_digest(expected, signature or "")
+
+
+def generated_image_public_url(relative_path: str, ttl_seconds: int | None = None) -> str:
+    ttl = settings.image_url_ttl_seconds if ttl_seconds is None else ttl_seconds
+    expires_at = now_ts() + ttl
+    signature = image_url_signature(relative_path, expires_at)
+    return (
+        f"{settings.public_base_url}/device-images/{relative_path}"
+        f"?{IMAGE_EXPIRES_PARAM}={expires_at}&{IMAGE_SIGNATURE_PARAM}={signature}"
+    )
+
+
+def resign_generated_image_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Refresh the signed ``public_url`` of a stored generated-image row.
+
+    The stored URL's signature expires; dashboard listings must hand the owner a
+    currently-valid link, so a fresh signature is minted from the recorded path.
+    """
+    relative_path = ""
+    local_path = str(record.get("local_path") or "")
+    if local_path:
+        try:
+            relative_path = (
+                Path(local_path)
+                .relative_to(settings.generated_images_dir)
+                .as_posix()
+            )
+        except (ValueError, OSError):
+            relative_path = ""
+    if not relative_path:
+        public_url = str(record.get("public_url") or "")
+        marker = "/device-images/"
+        index = public_url.find(marker)
+        if index != -1:
+            relative_path = public_url[index + len(marker):].split("?", 1)[0].split("#", 1)[0]
+    if relative_path:
+        record["public_url"] = generated_image_public_url(relative_path)
+    return record
 
 
 def save_generated_image_bytes(data: bytes, content_type: str, index: int) -> tuple[str, str, str, int]:
@@ -851,7 +936,7 @@ def save_generated_image_bytes(data: bytes, content_type: str, index: int) -> tu
     ext = image_extension(content_type, data)
     day = datetime.fromtimestamp(now_ts()).strftime("%Y%m%d")
     digest = hashlib.sha256(data).hexdigest()[:16]
-    filename = f"{now_ts()}-{secrets.token_urlsafe(6)}-{index}-{digest}{ext}"
+    filename = f"{now_ts()}-{generate_image_data_segment()}-{index}-{digest}{ext}"
     relative_path = f"{day}/{filename}"
     target = settings.generated_images_dir / day / filename
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1070,7 +1155,49 @@ async def persist_image_generation_response(
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    # Liveness only: cheap, no I/O, used by orchestrators to decide restarts.
     return {"ok": True, "service": "btf-device-gateway"}
+
+
+async def check_database_ready() -> bool:
+    """Deep readiness probe: the primary DB must be readable (SELECT 1)."""
+    try:
+        with connect(settings.database_path) as conn:
+            row = conn.execute("select 1").fetchone()
+        return row is not None and row[0] == 1
+    except sqlite3.Error:
+        logger.warning("readiness database check failed")
+        return False
+
+
+async def check_upstream_ready() -> bool | None:
+    """Best-effort upstream probe.
+
+    Returns ``True``/``False`` when ``NEW_API_BASE_URL`` is configured, and
+    ``None`` when it is not, so readiness depends only on the dependency that is
+    actually in use. Never raises.
+    """
+    if not settings.new_api_base_url:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=READY_UPSTREAM_TIMEOUT) as client:
+            response = await client.get(f"{settings.new_api_base_url}/api/status")
+        return response.status_code < 500
+    except httpx.HTTPError:
+        return False
+
+
+@app.get("/ready")
+async def ready() -> JSONResponse:
+    checks: dict[str, Any] = {"database": await check_database_ready()}
+    upstream = await check_upstream_ready()
+    if upstream is not None:
+        checks["upstream"] = upstream
+    ok = all(checks.values())
+    return JSONResponse(
+        status_code=200 if ok else 503,
+        content={"ok": ok, "service": "btf-device-gateway", "checks": checks},
+    )
 
 
 @app.get("/api/device/status")
@@ -1090,10 +1217,21 @@ def api_device_status(authorization: str | None = Header(default=None)) -> dict[
 
 
 @app.get("/device-images/{path:path}")
-def generated_device_image(path: str) -> FileResponse:
+def generated_device_image(
+    path: str,
+    exp: int | None = None,
+    sig: str | None = None,
+) -> FileResponse:
     clean_path = clean_relative_path(path)
     if clean_path is None:
         raise HTTPException(status_code=404, detail="not found")
+
+    # A valid short-lived HMAC signature (bound to this exact path) is required.
+    # Checked before touching the filesystem so unsigned/tampered/expired links
+    # are refused uniformly, without revealing whether a guessed path exists.
+    if exp is None or sig is None or not verify_image_signature(clean_path, exp, sig):
+        raise HTTPException(status_code=403, detail="invalid or expired image link")
+
     target = settings.generated_images_dir / clean_path
     try:
         target.relative_to(settings.generated_images_dir)
@@ -1101,7 +1239,7 @@ def generated_device_image(path: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="not found") from None
     if not target.is_file():
         raise HTTPException(status_code=404, detail="not found")
-    return FileResponse(target, headers={"Cache-Control": "public, max-age=31536000, immutable"})
+    return FileResponse(target, headers={"Cache-Control": IMAGE_CACHE_CONTROL})
 
 
 def normalize_mac(value: Any) -> str:
@@ -1981,6 +2119,8 @@ async def api_list_device_images(
         max(1, min(limit, 500)),
         None if dashboard_user.is_admin else dashboard_user.id,
     )
+    # Stored signatures expire; hand the owner a freshly signed URL each time.
+    items = [resign_generated_image_record(item) for item in items]
     return {"success": True, "message": "", "data": {"items": items, "total": len(items)}}
 
 
