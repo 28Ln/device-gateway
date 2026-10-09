@@ -189,6 +189,9 @@ def test_wechat_callback_decrypts_and_verifies_signature():
         "out_trade_no": "btf_ord_wechat",
         "transaction_id": "wx_tx_1",
         "trade_state": "SUCCESS",
+        # appid/mchid are now mandatory and must match the configured merchant.
+        "appid": "wx-app",
+        "mchid": "mch",
         "amount": {"total": 3999, "currency": "CNY"},
     }
     nonce = "123456789012"
