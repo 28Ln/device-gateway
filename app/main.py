@@ -2474,8 +2474,15 @@ def user_usage_rows(user_id: int | None = None) -> list[dict[str, Any]]:
                    coalesce(sum(case when e.created_at >= ? then e.total_tokens else 0 end), 0) as daily_tokens,
                    coalesce(sum(case when e.created_at >= ? then e.estimated_cost else 0 end), 0) as daily_estimated_cost
             from users u
-            left join devices d on d.user_id = u.id
-            left join usage_events e on coalesce(e.user_id, d.user_id) = u.id
+            left join (
+                select e.id as id,
+                       e.total_tokens as total_tokens,
+                       e.estimated_cost as estimated_cost,
+                       e.created_at as created_at,
+                       coalesce(e.user_id, d.user_id) as owner_id
+                from usage_events e
+                left join devices d on d.device_id = e.device_id
+            ) e on e.owner_id = u.id
             {where}
             group by u.id
             order by total_tokens desc, request_count desc, u.id
