@@ -281,12 +281,38 @@ def _migration_plan_default_models(conn: sqlite3.Connection) -> None:
     _migration_legacy_plan_defaults(conn)
 
 
+def normalize_active_expired_devices(conn: sqlite3.Connection) -> int:
+    """Normalise residual ``active`` + expired rows to ``disabled``.
+
+    Returns the number of rows repaired. Idempotent: a second call (or a
+    database without such rows) changes nothing and returns ``0``.
+    """
+    now = now_ts()
+    cursor = conn.execute(
+        "update devices set status = 'disabled' where status = 'active' and expires_at <= ?",
+        (now,),
+    )
+    return int(cursor.rowcount or 0)
+
+
+def _migration_normalize_active_expired(conn: sqlite3.Connection) -> None:
+    """Repair historic active+expired rows once (version-guarded).
+
+    Such a combination is invalid by construction. Anything a device renewal
+    would legitimately extend is written by the same code path that sets
+    ``status='active'`` with a future expiry, so quietly disabling the residual
+    rows never shortens a live entitlement (``expires_at`` is left untouched).
+    """
+    normalize_active_expired_devices(conn)
+
+
 # Version-guarded, run-once data migrations. Version numbers are an ordered
 # schema revision log; they are independent of the Python schema-generation
 # column patches (which are individually guarded by ``pragma table_info``).
 MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
     (1, _migration_backfill_usage_attribution),
     (2, _migration_plan_default_models),
+    (3, _migration_normalize_active_expired),
 ]
 
 
