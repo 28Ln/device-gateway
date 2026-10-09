@@ -5,6 +5,7 @@
 - [ ] `new-api` container is healthy.
 - [ ] `btf-device-gateway` container is running.
 - [ ] `GET /health` returns `200`.
+- [ ] `GET /ready` returns `200` (DB readable, upstream reachable) and `503` otherwise.
 - [ ] `GET /api/status` returns New API success.
 - [ ] The dashboard loads from the public origin.
 - [ ] The device menu is present in the existing dashboard.

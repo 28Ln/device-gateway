@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import os
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
 # Single source of truth for the public base URL default. This is a safe local
 # placeholder only; production MUST override it via the PUBLIC_BASE_URL env var.
 DEFAULT_PUBLIC_BASE_URL = "http://127.0.0.1:8080"
+
+# How long a signed ``/device-images/...`` link stays valid. Kept short so a
+# leaked URL (referer, logs, screenshots) cannot be replayed indefinitely, while
+# still covering a browser session. Validated to >= 60s so a typo cannot make
+# freshly generated images unreadable.
+DEFAULT_IMAGE_URL_TTL_SECONDS = 86400
+MIN_IMAGE_URL_TTL_SECONDS = 60
 
 
 def env_str(name: str, default: str = "") -> str:
@@ -50,10 +58,43 @@ class Settings:
     chat_completion_cost_per_million: float
     image_cost_per_request: float
     order_expires_seconds: int
+    # Dedicated HMAC secret for short-lived generated-image URLs. Optional: when
+    # unset the gateway derives a stable per-installation key from the data
+    # directory, so no extra secret is required to run.
+    image_url_signing_key: str
+    image_url_ttl_seconds: int
 
 
 def env_pem(name: str) -> str:
     return env_str(name).replace("\\n", "\n").strip()
+
+
+def _derived_image_signing_key(data_dir: Path) -> str:
+    """Return a stable per-installation secret for image URL signing.
+
+    Used only when ``BTF_IMAGE_URL_SIGNING_KEY`` is not configured. The key is
+    generated once with a CSPRNG and persisted (mode 0600) inside the data
+    directory, so signatures stay valid across restarts without requiring extra
+    operator configuration.
+    """
+    key_file = data_dir / ".image-url-key"
+    try:
+        existing = key_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        existing = ""
+    except OSError:
+        existing = ""
+    if existing:
+        return existing
+    key = secrets.token_urlsafe(48)
+    try:
+        fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(key)
+    except OSError:
+        # Read-only data dir: fall back to an ephemeral process-local key.
+        return key
+    return key
 
 
 def load_settings() -> Settings:
@@ -86,4 +127,13 @@ def load_settings() -> Settings:
         chat_completion_cost_per_million=float(env_str("BTF_CHAT_COMPLETION_COST_PER_MILLION", "0") or 0),
         image_cost_per_request=float(env_str("BTF_IMAGE_COST_PER_REQUEST", "0") or 0),
         order_expires_seconds=int(env_str("BTF_ORDER_EXPIRES_SECONDS", "86400") or 86400),
+        image_url_signing_key=env_str("BTF_IMAGE_URL_SIGNING_KEY")
+        or _derived_image_signing_key(data_dir),
+        image_url_ttl_seconds=max(
+            MIN_IMAGE_URL_TTL_SECONDS,
+            int(
+                env_str("BTF_IMAGE_URL_TTL_SECONDS", str(DEFAULT_IMAGE_URL_TTL_SECONDS))
+                or DEFAULT_IMAGE_URL_TTL_SECONDS
+            ),
+        ),
     )
