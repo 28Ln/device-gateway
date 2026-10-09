@@ -37,8 +37,27 @@ services:
     ports:
       - "80:8080"
     volumes:
+      # The container runs as uid 10001 (see Dockerfile). The host bind-mount
+      # must be writable by that uid or startup fails when the SQLite database
+      # and generated-images directory are created:
+      #   sudo mkdir -p ./data && sudo chown -R 10001:10001 ./data
       - ./data:/data
       - ./new-api-dist:/app/new-api-dist:ro
+    # The root filesystem is read-only; only the /data volume and an in-memory
+    # /tmp remain writable. Python bytecode writing is disabled in the image.
+    read_only: true
+    tmpfs:
+      - /tmp
+    # no-new-privileges blocks setuid/setgid privilege escalation even inside
+    # the container, complementing the non-root USER in the Dockerfile.
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
     networks:
       - new-api-network
 
