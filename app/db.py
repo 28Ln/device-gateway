@@ -4,12 +4,16 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 
 SCHEMA = """
 pragma journal_mode = wal;
 pragma foreign_keys = on;
+
+create table if not exists schema_version (
+  version integer not null
+);
 
 create table if not exists devices (
   id integer primary key autoincrement,
@@ -167,11 +171,119 @@ DEFAULT_IMAGE_MODELS = "[b2]gpt-image-2"
 def connect(database_path: Path) -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(database_path)
     conn.row_factory = sqlite3.Row
+    # Enable per-connection safety pragmas. ``foreign_keys`` is a no-op inside
+    # a transaction, so it has to run on every fresh connection (not once in
+    # ``executescript``) for foreign keys to be genuinely enforced. The busy
+    # timeout keeps transient writer lock contention from raising immediately.
+    conn.execute("pragma busy_timeout=5000")
+    conn.execute("pragma foreign_keys=on")
     try:
         yield conn
         conn.commit()
     finally:
         conn.close()
+
+
+def _applied_migrations(conn: sqlite3.Connection) -> set[int]:
+    try:
+        rows = conn.execute("select version from schema_version").fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {int(row[0]) for row in rows}
+
+
+def _record_migration(conn: sqlite3.Connection, version: int) -> None:
+    conn.execute("insert into schema_version(version) values (?)", (version,))
+
+
+def _backfill_usage_attribution(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        update usage_events
+        set user_id = (
+                select user_id from devices
+                where devices.device_id = usage_events.device_id
+            ),
+            plan_id = coalesce(plan_id, (
+                select plan_id from devices
+                where devices.device_id = usage_events.device_id
+            ))
+        where user_id is null or plan_id is null or plan_id = ''
+        """
+    )
+
+
+def _apply_data_migrations(conn: sqlite3.Connection) -> None:
+    """Ordered, idempotent data migrations guarded by ``schema_version``.
+
+    Each entry runs once per database. Entries must therefore be safe to skip
+    for fresh installations (the base ``SCHEMA`` + ``DEFAULT_PLANS`` insert
+    already produce the intended state) and must never overwrite values an
+    administrator has customized.
+    """
+    applied = _applied_migrations(conn)
+    for version, migrate in MIGRATIONS:
+        if version in applied:
+            continue
+        migrate(conn)
+        _record_migration(conn, version)
+
+
+def _apply_forward_migration(conn: sqlite3.Connection) -> None:
+    """Targeted, idempotent fix-ups that are cheap enough to re-check.
+
+    Unlike ``MIGRATIONS`` this is not version-gated: it only rewrites values
+    that still equal a previous built-in default, so re-running it is
+    idempotent and never touches administrator-customized plans.
+    """
+    _migration_legacy_plan_defaults(conn)
+
+
+def _migration_legacy_plan_defaults(conn: sqlite3.Connection) -> None:
+    # Installations created before the GPT-5.5 chat model and the corrected
+    # image model carry the previous built-in defaults. Only rows whose value
+    # exactly equals the old built-in default are rewritten, so any plan an
+    # administrator customized is left untouched.
+    previous_chat_models = "deepseek-v4.1-flash"
+    previous_image_models = "[b]gpt-image-2"
+    for plan in DEFAULT_PLANS:
+        conn.execute(
+            """
+            update plans
+            set chat_models = ?
+            where id = ? and chat_models = ?
+            """,
+            (DEFAULT_CHAT_MODELS, plan[0], previous_chat_models),
+        )
+        if plan[7]:
+            conn.execute(
+                """
+                update plans
+                set image_models = ?
+                where id = ? and image_models = ?
+                """,
+                (DEFAULT_IMAGE_MODELS, plan[0], previous_image_models),
+            )
+    conn.execute(
+        """
+        update plans
+        set image_models = ?
+        where allow_image = 1 and (image_models is null or image_models = '')
+        """,
+        (DEFAULT_IMAGE_MODELS,),
+    )
+
+
+def _migration_backfill_usage_attribution(conn: sqlite3.Connection) -> None:
+    _backfill_usage_attribution(conn)
+
+
+# Version-guarded, run-once data migrations. Version numbers are an ordered
+# schema revision log; they are independent of the Python schema-generation
+# column patches (which are individually guarded by ``pragma table_info``).
+MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
+    (1, _migration_backfill_usage_attribution),
+]
 
 
 def init_db(database_path: Path) -> None:
@@ -234,7 +346,6 @@ def init_db(database_path: Path) -> None:
             row["name"]
             for row in conn.execute("pragma table_info(plans)").fetchall()
         }
-        added_plan_entitlements = False
         plan_migrations = {
             "allow_deepseek": "integer not null default 1",
             "allow_image": "integer not null default 0",
@@ -254,7 +365,6 @@ def init_db(database_path: Path) -> None:
         for column, column_type in plan_migrations.items():
             if column not in plan_columns:
                 conn.execute(f"alter table plans add column {column} {column_type}")
-                added_plan_entitlements = True
         order_columns = {
             row["name"]
             for row in conn.execute("pragma table_info(orders)").fetchall()
@@ -295,20 +405,6 @@ def init_db(database_path: Path) -> None:
             if column not in usage_columns:
                 conn.execute(f"alter table usage_events add column {column} {column_type}")
         conn.execute(
-            """
-            update usage_events
-            set user_id = (
-                    select user_id from devices
-                    where devices.device_id = usage_events.device_id
-                ),
-                plan_id = coalesce(plan_id, (
-                    select plan_id from devices
-                    where devices.device_id = usage_events.device_id
-                ))
-            where user_id is null or plan_id is null or plan_id = ''
-            """
-        )
-        conn.execute(
             "create index if not exists idx_usage_user_created on usage_events(user_id, created_at)"
         )
         conn.execute(
@@ -339,20 +435,7 @@ def init_db(database_path: Path) -> None:
                 )
                 values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?, ?, ?, 'btf-chat', 'btf-image')
-                on conflict(id) do update set
-                  title = excluded.title,
-                  duration_days = excluded.duration_days,
-                  price_amount = excluded.price_amount,
-                  currency = excluded.currency,
-                  sort_order = excluded.sort_order,
-                  token_limit = excluded.token_limit,
-                  daily_token_limit = excluded.daily_token_limit,
-                  request_limit = excluded.request_limit,
-                  daily_request_limit = excluded.daily_request_limit,
-                  image_limit = excluded.image_limit,
-                  daily_image_limit = excluded.daily_image_limit,
-                  rpm_limit = excluded.rpm_limit,
-                  concurrency_limit = excluded.concurrency_limit
+                on conflict(id) do nothing
                 """,
                 (
                     *plan[:8],
@@ -361,79 +444,15 @@ def init_db(database_path: Path) -> None:
                     *plan[8:],
                 ),
             )
-        if added_plan_entitlements:
-            for plan in DEFAULT_PLANS:
-                conn.execute(
-                    """
-                    update plans
-                    set allow_deepseek = ?,
-                        allow_image = ?,
-                        chat_models = ?,
-                        image_models = ?,
-                        token_limit = ?,
-                        daily_token_limit = ?,
-                        request_limit = ?,
-                        daily_request_limit = ?,
-                        image_limit = ?,
-                        daily_image_limit = ?,
-                        rpm_limit = ?,
-                        concurrency_limit = ?,
-                        chat_alias = 'btf-chat',
-                        image_alias = 'btf-image'
-                    where id = ?
-                    """,
-                    (
-                        plan[6],
-                        plan[7],
-                        DEFAULT_CHAT_MODELS,
-                        DEFAULT_IMAGE_MODELS if plan[7] else "",
-                        *plan[8:],
-                        plan[0],
-                    ),
-                )
-            conn.execute(
-                """
-                update plans
-                set image_models = ?
-                where allow_image = 1 and (image_models is null or image_models = '')
-                """,
-                (DEFAULT_IMAGE_MODELS,),
-            )
 
-        # Forward migration for installations that already had the plan
-        # entitlement columns (so ``added_plan_entitlements`` is false). Those
-        # rows still carry the previous built-in defaults and would otherwise
-        # never gain the GPT-5.5 chat model or the corrected image model. Only
-        # rows whose value exactly equals the old built-in default are
-        # rewritten, so administrator-customized plans stay untouched.
-        previous_chat_models = "deepseek-v4.1-flash"
-        previous_image_models = "[b]gpt-image-2"
-        for plan in DEFAULT_PLANS:
-            conn.execute(
-                """
-                update plans
-                set chat_models = ?
-                where id = ? and chat_models = ?
-                """,
-                (DEFAULT_CHAT_MODELS, plan[0], previous_chat_models),
-            )
-            if plan[7]:
-                conn.execute(
-                    """
-                    update plans
-                    set image_models = ?
-                    where id = ? and image_models = ?
-                    """,
-                    (DEFAULT_IMAGE_MODELS, plan[0], previous_image_models),
-                )
-        conn.execute(
-            """
-            update plans
-            set image_models = ?
-            where allow_image = 1 and (image_models is null or image_models = '')
-            """,
-            (DEFAULT_IMAGE_MODELS,),
-        )
+        # Ordered, version-guarded data migrations (idempotent, once per
+        # database) plus a cheap re-runnable forward migration. Fresh
+        # databases already hold the intended state via ``SCHEMA`` and the
+        # insert-or-ignore above, so both are no-ops there while upgrading
+        # legacy databases without overwriting administrator customizations.
+        _apply_data_migrations(conn)
+        _apply_forward_migration(conn)
+
         conn.execute(
             """
             update devices
