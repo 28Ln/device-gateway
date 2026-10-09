@@ -107,15 +107,25 @@ def bind_device_user(database_path: Path, device_id: str, user_id: int | None) -
     return get_device(database_path, device_id)
 
 
-def create_device(database_path: Path, device_id: str, days: int, note: str = "", user_id: int | None = None) -> tuple[str, dict]:
+def create_device(
+    database_path: Path,
+    device_id: str,
+    days: int,
+    note: str = "",
+    user_id: int | None = None,
+    device_key: str | None = None,
+) -> tuple[str, dict]:
     validate_device_id(device_id)
     if days <= 0:
         raise ValueError("days must be greater than 0")
     if user_id is not None:
         get_user(database_path, user_id)
-    # BTF devices authenticate with their stable hardware identifier. This
-    # keeps CLI, batch import, and HTTP-created devices on the same contract.
-    key = device_id
+    # BTF devices authenticate with their stable hardware identifier by default,
+    # which keeps CLI, batch import, and HTTP-created devices on the same
+    # contract and does not break existing hardware provisioning. Callers that
+    # can provision a high-entropy secret (HTTP/CLI) may pass ``device_key`` to
+    # decouple the auth credential from the displayable device_id.
+    key = device_key if device_key is not None else device_id
     ts = now_ts()
     expires_at = ts + days * 86400
     with connect(database_path) as conn:
@@ -137,7 +147,7 @@ def create_device(database_path: Path, device_id: str, days: int, note: str = ""
                 device_id,
                 user_id,
                 hash_key(key),
-                key,
+                mask_key(key),
                 expires_at,
                 ts,
                 ts,

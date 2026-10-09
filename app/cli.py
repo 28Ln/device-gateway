@@ -67,7 +67,14 @@ def cmd_list_users(args: argparse.Namespace) -> None:
 def cmd_create_device(args: argparse.Namespace) -> None:
     settings = load_settings()
     ensure_ready(settings.database_path)
-    key, device = create_device(settings.database_path, args.device_id, args.days, args.note, args.user_id)
+    key, device = create_device(
+        settings.database_path,
+        args.device_id,
+        args.days,
+        args.note,
+        args.user_id,
+        device_key=getattr(args, "key", None),
+    )
     print(f"device_id={device['device_id']}")
     print(f"api_key={key}")
     print(f"base_url={settings.public_base_url}/v1")
@@ -245,6 +252,11 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--days", type=int, default=30)
     create.add_argument("--note", default="")
     create.add_argument("--user-id", type=int)
+    create.add_argument(
+        "--key",
+        default=None,
+        help="explicit auth key (defaults to device_id for hardware compatibility)",
+    )
     create.set_defaults(func=cmd_create_device)
 
     batch = sub.add_parser("batch-create")

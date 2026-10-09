@@ -36,7 +36,7 @@ from app.service import (
     record_usage,
     save_payment_intent,
 )
-from app.security import hash_key
+from app.security import hash_key, mask_key, verify_bind_code
 from app.payments import (
     MockPaymentProvider,
     PaymentError,
@@ -963,6 +963,10 @@ async def api_create_device(
     bind_code = normalize_bind_code(payload.get("bind_code"))
     if not bind_code and payload.get("generate_bind_code"):
         bind_code = new_bind_code()
+    # Optional explicit auth credential. When absent we keep the historical
+    # MAC-as-key behaviour so existing provisioning is unaffected.
+    device_key = str(payload.get("device_key") or "").strip() or None
+    resolved_key = device_key or mac
     if not mac or not expires_at:
         return {"success": False, "message": "invalid params"}
     if status not in {"active", "disabled"}:
@@ -994,8 +998,8 @@ async def api_create_device(
                 (
                     mac,
                     user_id,
-                    hash_key(mac),
-                    mac,
+                    hash_key(resolved_key),
+                    mask_key(resolved_key),
                     status,
                     expires_at,
                     ts,
@@ -1013,7 +1017,11 @@ async def api_create_device(
     return {
         "success": True,
         "message": "",
-        "data": {"created": True, "bind_code": bind_code if bind_code and dashboard_user.is_admin else ""},
+        "data": {
+            "created": True,
+            "device_key": resolved_key if device_key else "",
+            "bind_code": bind_code if bind_code and dashboard_user.is_admin else "",
+        },
     }
 
 
@@ -1073,7 +1081,7 @@ async def api_update_device(
                     mac,
                     user_id,
                     hash_key(mac),
-                    mac,
+                    mask_key(mac),
                     status,
                     expires_at,
                     ts,
@@ -1139,7 +1147,7 @@ async def api_batch_create_devices(
                         mac,
                         user_id,
                         hash_key(mac),
-                        mac,
+                        mask_key(mac),
                         expires_at,
                         ts,
                         ts,
@@ -1180,7 +1188,7 @@ async def api_bind_device_to_current_user(
             return {"success": False, "message": "device already bound"}
         if not device.get("bind_code_hash"):
             return {"success": False, "message": "device binding code is not configured"}
-        if device["bind_code_hash"] != hash_key(bind_code):
+        if not verify_bind_code(device.get("bind_code_hash"), bind_code):
             return {"success": False, "message": "invalid binding code"}
         conn.execute(
             """
