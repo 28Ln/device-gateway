@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
+import logging
+import os
 import re
 import secrets
+import socket
+import tempfile
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -74,6 +79,10 @@ BTF_IMAGE_ALIAS = "btf-image"
 ACTIVE_REQUESTS: dict[str, int] = {}
 ACTIVE_USER_REQUESTS: dict[int, int] = {}
 MAX_GENERATED_IMAGE_BYTES = 25 * 1024 * 1024
+MAX_IMAGE_REDIRECTS = 3
+IMAGE_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+IMAGE_DOWNLOAD_ALLOWED_SCHEMES = {"http", "https"}
+logger = logging.getLogger("btf_device_gateway")
 
 
 @dataclass(frozen=True)
@@ -666,8 +675,26 @@ def save_generated_image_bytes(data: bytes, content_type: str, index: int) -> tu
     relative_path = f"{day}/{filename}"
     target = settings.generated_images_dir / day / filename
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(data)
+    write_bytes_atomic(target, data)
     return relative_path, str(target), generated_image_public_url(relative_path), len(data)
+
+
+def write_bytes_atomic(target: Path, data: bytes) -> None:
+    """Write *data* to *target* atomically via a temp file + os.replace."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def decode_image_b64(value: str) -> tuple[bytes, str]:
@@ -679,22 +706,112 @@ def decode_image_b64(value: str) -> tuple[bytes, str]:
     return base64.b64decode(encoded, validate=False), content_type
 
 
+def is_public_ip(value: str) -> bool:
+    """Return True only for globally routable unicast IP addresses.
+
+    Rejects private/loopback/link-local/reserved/multicast/unspecified ranges,
+    including IPv4-mapped IPv6 addresses (which are unwrapped and re-checked).
+    """
+    try:
+        ip = ipaddress.ip_address(value.strip().strip("[]"))
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def resolve_host_ips(host: str) -> list[str]:
+    """Resolve a hostname to all of its IP addresses (literals included)."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return []
+    addresses: list[str] = []
+    for info in infos:
+        sockaddr = info[4]
+        if sockaddr and sockaddr[0] not in addresses:
+            addresses.append(sockaddr[0])
+    return addresses
+
+
+def validate_image_url(url: str) -> str:
+    """Validate that *url* is safe to fetch for generated-image persistence.
+
+    Enforces an http/https scheme and that every resolved IP is publicly
+    routable (SSRF guard). Returns the parsed host on success, raising
+    ValueError otherwise.
+    """
+    if not url or not isinstance(url, str):
+        raise ValueError("generated image URL is empty")
+    parts = urlparse(url)
+    scheme = parts.scheme.lower()
+    if scheme not in IMAGE_DOWNLOAD_ALLOWED_SCHEMES:
+        raise ValueError(f"generated image URL scheme not allowed: {scheme or '<none>'}")
+    host = parts.hostname
+    if not host:
+        raise ValueError("generated image URL has no host")
+    addresses = resolve_host_ips(host)
+    if not addresses:
+        raise ValueError(f"generated image URL host did not resolve: {host}")
+    for address in addresses:
+        if not is_public_ip(address):
+            raise ValueError(f"generated image URL resolves to non-public address: {address}")
+    return host
+
+
 async def download_image_url(url: str) -> tuple[bytes, str]:
-    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-        response = await client.get(
-            url,
-            headers={
-                "accept": "image/*,*/*;q=0.8",
-                "user-agent": "Mozilla/5.0",
-            },
-        )
-    response.raise_for_status()
-    content_type = response.headers.get("content-type", "image/png")
-    if "image/" not in content_type.lower():
-        raise ValueError("generated image URL did not return an image")
-    if len(response.content) > MAX_GENERATED_IMAGE_BYTES:
-        raise ValueError("generated image is too large")
-    return response.content, content_type
+    """Fetch an image URL with SSRF protection, streaming and size capping.
+
+    Redirects are followed manually (redirects disabled on the client) so that
+    every hop's host is re-validated, and bytes are accumulated incrementally so
+    an oversized response aborts as soon as it exceeds MAX_GENERATED_IMAGE_BYTES.
+    """
+    current_url = url
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as client:
+        for _ in range(MAX_IMAGE_REDIRECTS + 1):
+            validate_image_url(current_url)
+            request = client.build_request(
+                "GET",
+                current_url,
+                headers={
+                    "accept": "image/*,*/*;q=0.8",
+                    "user-agent": "Mozilla/5.0",
+                },
+            )
+            response = await client.send(request, stream=True)
+            try:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    await response.aclose()
+                    if not location:
+                        raise ValueError("generated image URL redirect missing location")
+                    current_url = str(httpx.URL(current_url).join(location))
+                    continue
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "image/png")
+                if "image/" not in content_type.lower():
+                    raise ValueError("generated image URL did not return an image")
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes(IMAGE_DOWNLOAD_CHUNK_BYTES):
+                    total += len(chunk)
+                    if total > MAX_GENERATED_IMAGE_BYTES:
+                        raise ValueError("generated image is too large")
+                    chunks.append(chunk)
+                if total == 0:
+                    raise ValueError("generated image is empty")
+                return b"".join(chunks), content_type
+            finally:
+                await response.aclose()
+    raise ValueError("generated image URL exceeded the redirect limit")
 
 
 async def persist_image_generation_response(
@@ -735,7 +852,16 @@ async def persist_image_generation_response(
                 image_content_type,
                 index,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "generated image persistence failed for device=%s index=%s url=%s: %s",
+                device_id,
+                index,
+                original_url,
+                exc,
+            )
+            item["btf_image_error"] = str(exc) or exc.__class__.__name__
+            changed = True
             continue
         record_generated_image(
             settings.database_path,
