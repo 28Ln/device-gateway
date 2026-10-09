@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -1375,13 +1376,41 @@ def health() -> dict[str, Any]:
 
 
 async def check_database_ready() -> bool:
-    """Deep readiness probe: the primary DB must be readable (SELECT 1)."""
+    """Deep readiness probe: the primary DB must be readable *and* well-formed.
+
+    A bare ``SELECT 1`` succeeds even when the file is zero bytes or corrupt
+    (SQLite happily opens it), which produced false-positive readiness and let
+    orchestrators route traffic to an instance whose ``/v1`` handlers 500. We
+    therefore also verify the core schema exists and (cheaply) that the b-tree
+    pages are consistent.
+    """
     try:
         with connect(settings.database_path) as conn:
             row = conn.execute("select 1").fetchone()
-        return row is not None and row[0] == 1
-    except sqlite3.Error:
-        logger.warning("readiness database check failed")
+            if row is None or row[0] != 1:
+                raise sqlite3.DatabaseError("select 1 returned no usable row")
+            tables = {
+                table_row[0]
+                for table_row in conn.execute(
+                    "select name from sqlite_master where type='table'"
+                ).fetchall()
+            }
+            if "devices" not in tables or "schema_version" not in tables:
+                raise sqlite3.DatabaseError("core tables missing")
+            # quick_check is the lightweight structural check: a non-"ok"
+            # first row means page-level corruption.
+            check_row = conn.execute("pragma quick_check").fetchone()
+            if check_row is None or str(check_row[0]).lower() != "ok":
+                raise sqlite3.DatabaseError("pragma quick_check failed")
+        return True
+    except asyncio.CancelledError:
+        # Never swallow cooperative cancellation.
+        raise
+    except Exception:
+        # Broad on purpose: a corrupt file can raise beyond sqlite3.Error
+        # (e.g. struct/OverflowError) and must be reported as "not ready",
+        # not escape as an HTTP 500.
+        logger.warning("readiness database check failed", exc_info=True)
         return False
 
 
