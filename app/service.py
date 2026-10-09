@@ -28,6 +28,13 @@ _LAST_EXPIRE_SWEEP: dict[str, int] = {}
 MAX_DEVICE_DAYS = 36500
 MAX_LIST_LIMIT = 100_000
 
+# Authoritative upper bound for a device/plan expiry (4_102_444_800 ==
+# 2100-01-01 UTC). The Web layer imports this single constant so the CLI/service
+# and HTTP paths agree on what is a storable expiry; a CLI-produced
+# ``expires_at`` that exceeded it could not be written back via
+# ``PUT /api/device/`` (``positive_expires_at`` would reject it with 400).
+MAX_EXPIRES_AT = 4_102_444_800
+
 
 class DeviceError(Exception):
     pass
@@ -68,6 +75,16 @@ def validate_days(days: int) -> None:
     """
     if not isinstance(days, int) or isinstance(days, bool) or days <= 0 or days > MAX_DEVICE_DAYS:
         raise ValueError(f"days must be between 1 and {MAX_DEVICE_DAYS}")
+
+
+def clamp_expires_at(value: int) -> int:
+    """Cap a computed expiry at ``MAX_EXPIRES_AT`` (single source of truth).
+
+    Keeps ``days * 86400`` arithmetic from persisting a timestamp the Web layer
+    would reject on write-back; the day-count bound (``MAX_DEVICE_DAYS``) is
+    unchanged, only the extreme absolute timestamp is clamped.
+    """
+    return min(value, MAX_EXPIRES_AT)
 
 
 def validate_limit(limit: int) -> None:
@@ -207,7 +224,7 @@ def create_device(
     # decouple the auth credential from the displayable device_id.
     key = device_key if device_key is not None else device_id
     ts = now_ts()
-    expires_at = ts + days * 86400
+    expires_at = clamp_expires_at(ts + days * 86400)
     with connect(database_path) as conn:
         exists = conn.execute(
             "select 1 from devices where device_id = ?",
@@ -215,27 +232,37 @@ def create_device(
         ).fetchone()
         if exists:
             raise Conflict(f"device already exists: {device_id}")
-        conn.execute(
-            """
-            insert into devices (
-              device_id, user_id, key_hash, key_mask, status, expires_at,
-              created_at, updated_at, note, plan_id, plan_started_at
+        try:
+            conn.execute(
+                """
+                insert into devices (
+                  device_id, user_id, key_hash, key_mask, status, expires_at,
+                  created_at, updated_at, note, plan_id, plan_started_at
+                )
+                values (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    device_id,
+                    user_id,
+                    hash_key(key),
+                    mask_key(key),
+                    expires_at,
+                    ts,
+                    ts,
+                    note,
+                    plan_id_for_days(days),
+                    ts,
+                ),
             )
-            values (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                device_id,
-                user_id,
-                hash_key(key),
-                mask_key(key),
-                expires_at,
-                ts,
-                ts,
-                note,
-                plan_id_for_days(days),
-                ts,
-            ),
-        )
+        except sqlite3.IntegrityError as exc:
+            # The insert is also bounded by the ``key_hash`` UNIQUE index. A
+            # reused device key (e.g. ``create-device --key <dup>``) otherwise
+            # leaks a raw ``sqlite3.IntegrityError``/UNIQUE-constraint traceback
+            # out of the CLI. Translate it to the same domain ``Conflict`` used
+            # for a duplicate device_id, without echoing the SQL text.
+            if "key_hash" in str(exc):
+                raise Conflict("device key already exists") from exc
+            raise Conflict(f"device already exists: {device_id}") from exc
     return key, get_device(database_path, device_id)
 
 
@@ -381,7 +408,7 @@ def renew_device(database_path: Path, device_id: str, days: int) -> dict:
         if not row:
             raise NotFound(f"device not found: {device_id}")
         base = max(row["expires_at"], ts)
-        expires_at = base + days * 86400
+        expires_at = clamp_expires_at(base + days * 86400)
         conn.execute(
             """
             update devices
@@ -428,7 +455,7 @@ def enable_device(database_path: Path, device_id: str, days_if_expired: int = 30
         # A lapsed device needs an explicit positive renewal window; extending
         # from "now" (not from the stale expiry) keeps the new expiry future-dated,
         # so the row can safely become ``active`` instead of active+expired.
-        expires_at = ts + days_if_expired * 86400
+        expires_at = clamp_expires_at(ts + days_if_expired * 86400)
     with connect(database_path) as conn:
         conn.execute(
             """
