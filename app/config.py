@@ -117,6 +117,31 @@ class Settings:
     # directory, so no extra secret is required to run.
     image_url_signing_key: str
     image_url_ttl_seconds: int
+    log_level: str
+    payment_notify_rate_limit: int
+    payment_notify_max_body_bytes: int
+
+
+# Recognised logging levels. An unknown/blank value falls back to INFO so a typo
+# can never silence the gateway's operational logs.
+_VALID_LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
+
+
+def env_log_level(name: str = "BTF_LOG_LEVEL", default: str = "INFO") -> str:
+    value = env_str(name, default).upper()
+    return value if value in _VALID_LOG_LEVELS else default
+
+
+def env_positive_int(name: str, default: int, minimum: int = 1) -> int:
+    """Return a positive integer env var, ignoring unset/blank/non-numeric input."""
+    raw = env_str(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= minimum else default
 
 
 def env_pem(name: str) -> str:
@@ -191,5 +216,11 @@ def load_settings() -> Settings:
                 env_str("BTF_IMAGE_URL_TTL_SECONDS", str(DEFAULT_IMAGE_URL_TTL_SECONDS))
                 or DEFAULT_IMAGE_URL_TTL_SECONDS
             ),
+        ),
+        log_level=env_log_level(),
+        # Process-local callback throttle: N callbacks per window (see main.py).
+        payment_notify_rate_limit=env_positive_int("BTF_PAYMENT_NOTIFY_RATE_LIMIT", 60),
+        payment_notify_max_body_bytes=env_positive_int(
+            "BTF_PAYMENT_NOTIFY_MAX_BODY_BYTES", 256 * 1024
         ),
     )
