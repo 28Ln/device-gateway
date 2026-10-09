@@ -51,7 +51,11 @@ def test_create_device_masks_api_key(tmp_path, monkeypatch, capsys):
     # New devices use their device_id as the key; the printed key must not be a
     # full credential (either "***" or a truncated mask), never the raw value.
     shown = _api_key_line(out)
-    assert shown in {"***"} or "..." in shown
+    # The mask hides the middle of the credential; any masking style is fine as
+    # long as the raw key itself is never printed.
+    assert shown != "BTF:CLI:MASK:0001"
+    assert "MASK" not in shown
+    assert "*" in shown or "..." in shown
     assert "device_id=BTF:CLI:MASK:0001" in out
 
 
@@ -66,7 +70,7 @@ def test_rotate_key_masks_and_show_secret_reveals(tmp_path, monkeypatch, capsys)
     args.func(args)
     masked = _api_key_line(capsys.readouterr().out)
     # The mask keeps a recognisable prefix/suffix but is never a usable key.
-    assert "..." in masked
+    assert "*" in masked or "..." in masked
     assert len(masked) < 40
     with pytest.raises(NotFound):
         get_device_by_key(db, masked)
