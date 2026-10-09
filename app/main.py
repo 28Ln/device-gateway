@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import secrets
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,14 @@ from urllib.parse import unquote
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
+from starlette.background import BackgroundTask
 
 from app.config import load_settings
 from app.db import DEFAULT_CHAT_MODELS, connect
@@ -74,6 +82,43 @@ BTF_IMAGE_ALIAS = "btf-image"
 ACTIVE_REQUESTS: dict[str, int] = {}
 ACTIVE_USER_REQUESTS: dict[int, int] = {}
 MAX_GENERATED_IMAGE_BYTES = 25 * 1024 * 1024
+SSE_USAGE_TAIL_BYTES = 64 * 1024
+
+# Shared upstream client for the device proxy: connection reuse plus split
+# connect/read/write/pool timeouts. A single total cap of 120s matches the
+# previous behaviour for legacy (non-streaming) responses.
+_UPSTREAM_TIMEOUT = httpx.Timeout(120.0, connect=10.0, read=120.0, write=30.0, pool=10.0)
+# Dedicated client for SSE: each read may legitimately idle between events,
+# so give reads a longer ceiling while still bounding connect/pool.
+_STREAM_TIMEOUT = httpx.Timeout(600.0, connect=10.0, read=300.0, write=30.0, pool=10.0)
+_upstream_client: httpx.AsyncClient | None = None
+_stream_client: httpx.AsyncClient | None = None
+
+
+def upstream_client() -> httpx.AsyncClient:
+    """Return the lazily created shared upstream client.
+
+    The client is created on first use (inside the running event loop) and kept
+    for connection reuse across requests. Tests may rebind ``_upstream_client``.
+    """
+    global _upstream_client
+    if _upstream_client is None:
+        _upstream_client = httpx.AsyncClient(
+            timeout=_UPSTREAM_TIMEOUT,
+            follow_redirects=False,
+        )
+    return _upstream_client
+
+
+def stream_client() -> httpx.AsyncClient:
+    """Return the shared client used for streaming (SSE) upstream calls."""
+    global _stream_client
+    if _stream_client is None:
+        _stream_client = httpx.AsyncClient(
+            timeout=_STREAM_TIMEOUT,
+            follow_redirects=False,
+        )
+    return _stream_client
 
 
 @dataclass(frozen=True)
@@ -2071,18 +2116,106 @@ async def api_get_device(
     return {"success": True, "message": "", "data": device_row_to_new_api(device)}
 
 
-def extract_usage(payload: bytes, content_type: str) -> tuple[int, int, int]:
-    if "application/json" not in content_type.lower():
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_usage(payload: Any) -> tuple[int, int, int]:
+    """Return (prompt, completion, total) tokens from an OpenAI-style payload."""
+    if not isinstance(payload, dict):
         return 0, 0, 0
+    usage = payload.get("usage") or {}
+    if not isinstance(usage, dict):
+        return 0, 0, 0
+    prompt = _safe_int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    completion = _safe_int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    total = _safe_int(usage.get("total_tokens") or prompt + completion)
+    return prompt, completion, total
+
+
+def usage_from_payload_bytes(payload: bytes) -> tuple[int, int, int]:
     try:
         data = json.loads(payload.decode("utf-8"))
     except Exception:
         return 0, 0, 0
-    usage = data.get("usage") or {}
-    prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-    completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-    total = int(usage.get("total_tokens") or prompt + completion)
-    return prompt, completion, total
+    return normalize_usage(data)
+
+
+def extract_usage(payload: bytes, content_type: str) -> tuple[int, int, int]:
+    if "application/json" not in content_type.lower():
+        return 0, 0, 0
+    return usage_from_payload_bytes(payload)
+
+
+def request_wants_stream(body: bytes, content_type: str) -> bool:
+    """Detect an explicit client request for streaming.
+
+    Conservative: any parse failure or non-JSON content type means "not
+    streaming", so the legacy buffered behaviour is preserved.
+    """
+    if "application/json" not in (content_type or "").lower():
+        return False
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except Exception:
+        return False
+    return isinstance(data, dict) and data.get("stream") is True
+
+
+def upstream_response_is_stream(response: httpx.Response) -> bool:
+    content_type = response.headers.get("content-type", "")
+    return "text/event-stream" in content_type.lower()
+
+
+def extract_stream_usage(buffer: str) -> tuple[int, int, int]:
+    """Parse the last ``data:`` usage block seen in a buffered SSE tail.
+
+    Scans from the most recent line backwards so the final usage chunk wins,
+    which is what ``stream_options.include_usage`` providers emit last.
+    """
+    for raw_line in reversed(buffer.splitlines()):
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if not data or data == "[DONE]":
+            continue
+        prompt, completion, total = usage_from_payload_bytes(data.encode("utf-8"))
+        if total or prompt or completion:
+            return prompt, completion, total
+    return 0, 0, 0
+
+
+async def stream_proxy_body(
+    upstream: httpx.Response,
+    buffer: list[bytearray],
+    on_complete: Callable[[], None] | None = None,
+) -> AsyncIterator[bytes]:
+    """Yield upstream SSE bytes verbatim, keeping a bounded usage tail.
+
+    ``buffer`` accumulates the last ``SSE_USAGE_TAIL_BYTES`` of the body so the
+    final usage chunk can be parsed after the stream completes without
+    allocating the whole response in memory. ``on_complete`` (if given) runs
+    once the generator ends, including on client disconnect / cancellation.
+    """
+    try:
+        tail = bytearray()
+        async for chunk in upstream.aiter_bytes():
+            if not chunk:
+                continue
+            yield chunk
+            tail.extend(chunk)
+            if len(tail) > SSE_USAGE_TAIL_BYTES:
+                del tail[: len(tail) - SSE_USAGE_TAIL_BYTES]
+        buffer[0] = tail
+    finally:
+        # Guarantee the connection is released even if the client disconnects.
+        await upstream.aclose()
+        if on_complete is not None:
+            on_complete()
 
 
 def estimated_request_cost(
@@ -2141,10 +2274,14 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
     clean_path = clean_v1_proxy_path(path)
     if clean_path is None:
         raise HTTPException(status_code=404, detail="not found")
+    # Device authentication and plan/quota checks happen here, before any
+    # upstream call or streaming response starts. Streaming requests therefore
+    # can never emit bytes before they are authorized.
     auth = authenticate_device(settings.database_path, bearer_token(authorization))
     body = await request.body()
     original_body = body
     requested_model = request_model_from_body(body)
+    wants_stream = request_wants_stream(body, request.headers.get("content-type", ""))
     body = enforce_plan_access(auth.device_id, clean_path, request.method, body)
     upstream_model = request_model_from_body(body)
     plan = plan_entitlements_for_device(auth.device_id)
@@ -2157,38 +2294,115 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
     ACTIVE_REQUESTS[auth.device_id] = ACTIVE_REQUESTS.get(auth.device_id, 0) + 1
     if user_id:
         ACTIVE_USER_REQUESTS[user_id] = ACTIVE_USER_REQUESTS.get(user_id, 0) + 1
+
+    # Reuse a shared upstream client (connection pooling). Streaming requests
+    # use the client with the longer read ceiling since SSE frames may idle
+    # between events. Either way the request is sent un-buffered (stream=True)
+    # so that an upstream that answers with text/event-stream can be relayed
+    # chunk-by-chunk without ever materialising the whole body.
+    client = stream_client() if wants_stream else upstream_client()
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            upstream = await client.request(
-                request.method,
-                target,
-                content=body,
-                params=request.query_params,
-                headers=headers,
-            )
+        upstream_request = client.build_request(
+            request.method,
+            target,
+            content=body,
+            params=request.query_params,
+            headers=headers,
+        )
+        upstream = await client.send(upstream_request, stream=True)
+    except BaseException:
+        _release_active_request(auth.device_id, user_id)
+        raise
+    content_type = upstream.headers.get("content-type", "")
+
+    if upstream.status_code < 400 and upstream_response_is_stream(upstream):
+        # Stream SSE bytes straight through. Usage is parsed from the buffered
+        # tail afterwards. The concurrency slot stays reserved for the whole
+        # streamed response (matching the previous "hold during request"
+        # semantics) and is released when the body generator finishes or is
+        # cancelled.
+        stream_buffer: list[bytearray] = [bytearray()]
+        return StreamingResponse(
+            stream_proxy_body(
+                upstream,
+                stream_buffer,
+                on_complete=lambda: _release_active_request(auth.device_id, user_id),
+            ),
+            status_code=upstream.status_code,
+            media_type=content_type or "text/event-stream",
+            headers=proxy_response_headers(upstream.headers),
+            background=BackgroundTask(
+                _finalize_stream_usage,
+                stream_buffer,
+                auth.device_id,
+                clean_path,
+                user_id,
+                plan_id,
+                requested_model,
+                upstream_model,
+            ),
+        )
+
+    # Non-streaming (or failed) response: read the body, record usage (cost 0
+    # on upstream errors) and answer exactly as before.
+    try:
+        content = await upstream.aread()
     finally:
-        ACTIVE_REQUESTS[auth.device_id] = max(ACTIVE_REQUESTS.get(auth.device_id, 1) - 1, 0)
-        if ACTIVE_REQUESTS[auth.device_id] == 0:
-            ACTIVE_REQUESTS.pop(auth.device_id, None)
-        if user_id:
-            ACTIVE_USER_REQUESTS[user_id] = max(ACTIVE_USER_REQUESTS.get(user_id, 1) - 1, 0)
-            if ACTIVE_USER_REQUESTS[user_id] == 0:
-                ACTIVE_USER_REQUESTS.pop(user_id, None)
-    prompt, completion, total = extract_usage(
-        upstream.content,
-        upstream.headers.get("content-type", ""),
-    )
-    estimated_cost = estimated_request_cost(
+        await upstream.aclose()
+    _release_active_request(auth.device_id, user_id)
+    return await _record_and_build_response(
+        request,
         clean_path,
-        prompt,
-        completion,
+        auth.device_id,
+        user_id,
+        plan_id,
+        requested_model,
         upstream_model,
+        upstream.status_code,
+        content,
+        content_type,
+        upstream.headers,
+        original_body,
+    )
+
+
+def _release_active_request(device_id: str, user_id: int | None) -> None:
+    ACTIVE_REQUESTS[device_id] = max(ACTIVE_REQUESTS.get(device_id, 1) - 1, 0)
+    if ACTIVE_REQUESTS[device_id] == 0:
+        ACTIVE_REQUESTS.pop(device_id, None)
+    if user_id:
+        ACTIVE_USER_REQUESTS[user_id] = max(ACTIVE_USER_REQUESTS.get(user_id, 1) - 1, 0)
+        if ACTIVE_USER_REQUESTS[user_id] == 0:
+            ACTIVE_USER_REQUESTS.pop(user_id, None)
+
+
+async def _record_and_build_response(
+    request: Request,
+    clean_path: str,
+    device_id: str,
+    user_id: int | None,
+    plan_id: str,
+    requested_model: str,
+    upstream_model: str,
+    status_code: int,
+    content_bytes: bytes,
+    content_type: str,
+    upstream_headers: httpx.Headers,
+    original_body: bytes,
+) -> Response:
+    prompt, completion, total = extract_usage(content_bytes, content_type)
+    # A failed upstream response must not be billed; the event is still
+    # recorded so the request is auditable and counted as a request.
+    estimated_cost = (
+        0.0
+        if status_code >= 400
+        else estimated_request_cost(clean_path, prompt, completion, upstream_model)
     )
     usage_event_id = record_usage(
         settings.database_path,
-        auth.device_id,
+        device_id,
         f"/v1/{clean_path}",
-        upstream.status_code,
+        status_code,
         prompt,
         completion,
         total,
@@ -2198,12 +2412,12 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
         upstream_model,
         estimated_cost,
     )
-    content = upstream.content
-    if upstream.status_code < 400 and clean_path == "images/generations":
+    content = content_bytes
+    if status_code < 400 and clean_path == "images/generations":
         content = await persist_image_generation_response(
             content,
-            upstream.headers.get("content-type", ""),
-            auth.device_id,
+            content_type,
+            device_id,
             user_id,
             plan_id,
             requested_model,
@@ -2211,24 +2425,51 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
             original_body,
             usage_event_id,
         )
-    if request.method == "GET" and clean_path == "models" and upstream.status_code == 200:
-        content = filter_models_response(
-            upstream.content,
-            upstream.headers.get("content-type", ""),
-            auth.device_id,
-        )
-    elif upstream.status_code < 400:
-        content = alias_model_response(
-            content,
-            upstream.headers.get("content-type", ""),
-            auth.device_id,
-        )
+    if request.method == "GET" and clean_path == "models" and status_code == 200:
+        content = filter_models_response(content, content_type, device_id)
+    elif status_code < 400:
+        content = alias_model_response(content, content_type, device_id)
     return Response(
         content=content,
-        status_code=upstream.status_code,
-        headers=proxy_response_headers(upstream.headers),
-        media_type=upstream.headers.get("content-type"),
+        status_code=status_code,
+        headers=proxy_response_headers(upstream_headers),
+        media_type=upstream_headers.get("content-type"),
     )
+
+
+async def _finalize_stream_usage(
+    stream_buffer: list[bytearray],
+    device_id: str,
+    clean_path: str,
+    user_id: int | None,
+    plan_id: str,
+    requested_model: str,
+    upstream_model: str,
+) -> None:
+    """Record usage for a streamed response after all bytes were forwarded.
+
+    Usage comes from the last ``data:`` usage block when the upstream honours
+    ``stream_options.include_usage``; otherwise the request is still recorded
+    with zero tokens so streaming never silently disappears from the ledger.
+    """
+    raw = bytes(stream_buffer[0]) if stream_buffer else b""
+    prompt, completion, total = extract_stream_usage(raw.decode("utf-8", "replace"))
+    estimated_cost = estimated_request_cost(clean_path, prompt, completion, upstream_model)
+    record_usage(
+        settings.database_path,
+        device_id,
+        f"/v1/{clean_path}",
+        200,
+        prompt,
+        completion,
+        total,
+        user_id,
+        plan_id,
+        requested_model,
+        upstream_model,
+        estimated_cost,
+    )
+
 
 
 def augment_customer_self_response(content: bytes, content_type: str) -> bytes:
