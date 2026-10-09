@@ -522,12 +522,21 @@ def test_device_images_rejects_traversal(monkeypatch, tmp_path):
         "/device-images/./x.png",
     ):
         response = client.get(path)
-        assert response.status_code in (400, 404), path
+        # Traversal is rejected (400/404); a sanitized-but-unsigned path is
+        # rejected by the signature gate (403). Either way it is never served.
+        assert response.status_code in (400, 403, 404), path
 
-    # A legitimately stored image is still served.
+    # An unsigned request for a valid stored file is refused by the signature
+    # gate: the path is not a usable credential on its own.
     target = images_dir / "20260101" / "sample.png"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(b"\x89PNG\r\n\x1a\n" + b"integration")
-    ok = client.get("/device-images/20260101/sample.png")
+    unsigned = client.get("/device-images/20260101/sample.png")
+    assert unsigned.status_code == 403
+
+    # A short-lived signed URL handed to the owner is still served.
+    signed_url = main.generated_image_public_url("20260101/sample.png")
+    signed_path = signed_url[len(main.settings.public_base_url):]
+    ok = client.get(signed_path)
     assert ok.status_code == 200
     assert ok.content.startswith(b"\x89PNG")
