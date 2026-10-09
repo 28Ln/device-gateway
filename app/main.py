@@ -64,6 +64,15 @@ OPENAI_V1_PREFIXES = {
     "moderations",
     "responses",
 }
+# First path segments that the catch-all route is allowed to forward upstream
+# to new-api. This is intentionally a superset of the prefixes consumed by the
+# more specific routes declared above (``/api/device/...``, ``/api/log/...``)
+# plus the new-api endpoints the SPA relies on.
+NEW_API_PROXY_PREFIXES = {
+    "api",
+    "v1",
+    "health",
+}
 SAFE_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._~:-]+$")
 DEEPSEEK_MODELS = {"deepseek-v4.1-flash"}
 WEB_SEARCH_MODELS = {"gpt-5.5"}
@@ -142,6 +151,27 @@ def clean_v1_proxy_path(path: str) -> str | None:
         return None
     first_segment = clean_path.split("/", 1)[0]
     if first_segment not in OPENAI_V1_PREFIXES:
+        return None
+    return clean_path
+
+
+def clean_new_api_proxy_path(path: str) -> str | None:
+    """Sanitize a path before it is appended to the upstream new-api base URL.
+
+    ``{path:path}`` is attacker controllable. Rejecting traversal / absolute /
+    malformed encodings here keeps unauthenticated callers from reaching
+    arbitrary new-api routes once httpx normalizes the URL. Only the
+    documented prefixes may be forwarded.
+    """
+    raw = path or ""
+    raw_segments = raw.replace("\\", "/").split("/")
+    if any(segment in {"..", "."} for segment in raw_segments):
+        return None
+    clean_path = clean_relative_path(raw)
+    if clean_path is None:
+        return None
+    first_segment = clean_path.split("/", 1)[0]
+    if first_segment not in NEW_API_PROXY_PREFIXES:
         return None
     return clean_path
 
@@ -2103,12 +2133,54 @@ def estimated_request_cost(
     return 0.0
 
 
-def proxy_response_headers(headers: httpx.Headers) -> dict[str, str]:
-    return {
-        key: value
-        for key, value in headers.items()
-        if key.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length"}
-    }
+class UpstreamHeaders:
+    """Header view for upstream chunks that must not drop duplicates.
+
+    Starlette/httpx merge repeated headers into a comma separated value, which
+    breaks ``Set-Cookie``. ``init_headers`` only relies on ``.items()`` so we
+    expose the raw pairs from ``multi_items()`` instead.
+    """
+
+    __slots__ = ("_items",)
+
+    def __init__(self, items: list[tuple[str, str]]) -> None:
+        self._items = items
+
+    def items(self) -> list[tuple[str, str]]:
+        return list(self._items)
+
+
+def proxy_response_headers(headers: httpx.Headers) -> UpstreamHeaders:
+    """Forward upstream response headers while preserving duplicate values."""
+    return UpstreamHeaders(
+        [
+            (key, value)
+            for key, value in headers.multi_items()
+            if key.lower()
+            not in {"content-encoding", "transfer-encoding", "connection", "content-length"}
+        ]
+    )
+
+
+_HASHED_ASSET_RE = re.compile(r"[.-][0-9a-fA-F]{8,}\.[A-Za-z0-9]+$")
+IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+NO_CACHE_CONTROL = "no-cache, must-revalidate"
+
+
+def static_cache_control(path: str) -> str:
+    """Pick a Cache-Control policy for a served frontend file.
+
+    Content-hashed build artifacts never change, so they are safe to cache
+    forever. HTML entry points must always be revalidated so clients pick up
+    new asset hashes.
+    """
+    normalized = path.replace("\\", "/").lstrip("/")
+    if normalized.endswith(".html") or normalized == "":
+        return NO_CACHE_CONTROL
+    filename = normalized.rsplit("/", 1)[-1]
+    if _HASHED_ASSET_RE.search(filename):
+        return IMMUTABLE_CACHE_CONTROL
+    return NO_CACHE_CONTROL
 
 
 def upstream_proxy_headers(request: Request) -> dict[str, str]:
@@ -2265,26 +2337,41 @@ def augment_customer_self_response(content: bytes, content_type: str) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+@app.api_route(
+    "/{path:path}",
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
 async def proxy_new_api(path: str, request: Request) -> Response:
+    raw_path = path or ""
+
+    # The SPA entry point is the only request that maps to an empty path.
+    if request.method in {"GET", "HEAD"} and raw_path.strip("/") == "":
+        if frontend_dist.exists():
+            index_file = frontend_dist / "index.html"
+            if index_file.is_file():
+                return FileResponse(
+                    index_file,
+                    headers={"Cache-Control": static_cache_control("index.html")},
+                )
+        raise HTTPException(status_code=404, detail="not found")
+
+    # Reject traversal / absolute / malformed encodings before anything else so
+    # unauthenticated callers cannot steer httpx to an arbitrary upstream path.
+    clean_path = clean_new_api_proxy_path(raw_path)
+    if clean_path is None:
+        raise HTTPException(status_code=404, detail="not found")
+
     if request.method in {"GET", "HEAD"} and frontend_dist.exists():
-        first = path.split("/", 1)[0]
+        first = clean_path.split("/", 1)[0]
         if first not in {"api", "v1", "health"}:
             static_asset_roots = {"assets", "favicon.ico", "static"}
-            if not path:
-                index_file = frontend_dist / "index.html"
-                if index_file.is_file():
-                    return FileResponse(
-                        index_file,
-                        headers={"Cache-Control": "no-store"},
-                    )
-            target_file = frontend_file_for_path(path)
+            target_file = frontend_file_for_path(clean_path)
             if target_file is None:
                 raise HTTPException(status_code=404, detail="not found")
             if target_file.is_file():
                 return FileResponse(
                     target_file,
-                    headers={"Cache-Control": "no-store"},
+                    headers={"Cache-Control": static_cache_control(clean_path)},
                 )
             if first in static_asset_roots:
                 raise HTTPException(status_code=404, detail="not found")
@@ -2292,12 +2379,15 @@ async def proxy_new_api(path: str, request: Request) -> Response:
             if index_file.is_file():
                 return FileResponse(
                     index_file,
-                    headers={"Cache-Control": "no-store"},
+                    headers={"Cache-Control": static_cache_control("index.html")},
                 )
+
+    if not settings.new_api_token:
+        raise HTTPException(status_code=500, detail="gateway missing NEW_API_TOKEN")
 
     body = await request.body()
     headers = upstream_proxy_headers(request)
-    target = f"{settings.new_api_base_url}/{path}"
+    target = f"{settings.new_api_base_url}/{clean_path}"
     async with httpx.AsyncClient(timeout=120.0, follow_redirects=False) as client:
         upstream = await client.request(
             request.method,
@@ -2307,7 +2397,7 @@ async def proxy_new_api(path: str, request: Request) -> Response:
             headers=headers,
         )
     content = upstream.content
-    if request.method == "GET" and path.strip("/") == "api/user/self" and upstream.status_code == 200:
+    if request.method == "GET" and clean_path == "api/user/self" and upstream.status_code == 200:
         content = augment_customer_self_response(
             content,
             upstream.headers.get("content-type", ""),
