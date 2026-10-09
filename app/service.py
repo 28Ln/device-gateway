@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sqlite3
 import secrets
 import re
@@ -962,6 +963,39 @@ def list_generated_images(
     return [dict(row) for row in rows]
 
 
+_SQLITE_INT64_MAX = 2**63 - 1
+_SQLITE_INT64_MIN = -(2**63)
+
+
+def _clamp_token(value: int | None) -> int:
+    """Clamp a token/user counters field into the SQLite signed 64-bit range.
+
+    Upstream usage can carry values outside int64 (``2**63``) or non-finite
+    floats (``1e999``); binding those raises ``OverflowError`` from SQLite.
+    Such values are neutralised to 0 instead so accounting never 500s.
+    """
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if ivalue < _SQLITE_INT64_MIN or ivalue > _SQLITE_INT64_MAX:
+        return 0
+    return ivalue
+
+
+def _clamp_cost(value: float | int | None) -> float:
+    """Clamp an estimated cost to a finite value within the int64-safe range."""
+    try:
+        fvalue = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(fvalue):
+        return 0.0
+    if fvalue < _SQLITE_INT64_MIN or fvalue > _SQLITE_INT64_MAX:
+        return 0.0
+    return fvalue
+
+
 def record_usage(
     database_path: Path,
     device_id: str,
@@ -976,6 +1010,12 @@ def record_usage(
     upstream_model: str = "",
     estimated_cost: float = 0,
 ) -> int:
+    prompt_tokens = _clamp_token(prompt_tokens)
+    completion_tokens = _clamp_token(completion_tokens)
+    total_tokens = _clamp_token(total_tokens)
+    if user_id is not None:
+        user_id = _clamp_token(user_id)
+    estimated_cost = _clamp_cost(estimated_cost)
     ts = now_ts()
     with connect(database_path) as conn:
         cursor = conn.execute(

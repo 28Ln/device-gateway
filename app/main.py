@@ -559,10 +559,12 @@ async def resolve_dashboard_user(
         user = payload.get("data") or {}
         if not isinstance(user, dict):
             raise ValueError("invalid dashboard session payload")
-        user_id = int(user.get("id") or 0)
-        role = int(user.get("role") or 0)
+        # ``_safe_int`` clamps ``1e999``/``2**63``-style ids (OverflowError from
+        # raw ``int()``) so a hostile upstream body yields 401, never a 500.
+        user_id = _safe_int(user.get("id"))
+        role = _safe_int(user.get("role"))
         username = str(user.get("username") or "")
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (TypeError, ValueError, OverflowError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=401, detail="invalid dashboard session") from exc
     if not payload.get("success") or user_id <= 0:
         raise HTTPException(status_code=401, detail="invalid dashboard session")
@@ -3253,11 +3255,39 @@ async def api_get_device(
     return {"success": True, "message": "", "data": device_row_to_new_api(device)}
 
 
+_INT64_MAX = 2**63 - 1
+_INT64_MIN = -(2**63)
+
+
 def _safe_int(value: Any) -> int:
+    """Coerce an upstream/client-supplied value to a bounded int.
+
+    Upstream JSON can carry ``1e999`` (a non-finite float), ``2**63`` or larger
+    (finite but outside the signed 64-bit range) or a numeric string. Anything
+    that is not a finite integer within int64 collapses to 0 so the value can
+    never bind SQLite (which raises ``OverflowError`` outside int64) nor poison
+    downstream arithmetic.
+    """
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                return 0
+            parsed = int(value)
+        elif isinstance(value, str):
+            try:
+                parsed = int(value.strip())
+            except ValueError:
+                as_float = float(value.strip())
+                if not math.isfinite(as_float):
+                    return 0
+                parsed = int(as_float)
+        else:
+            parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
         return 0
+    if parsed < _INT64_MIN or parsed > _INT64_MAX:
+        return 0
+    return parsed
 
 
 def normalize_usage(payload: Any) -> tuple[int, int, int]:
@@ -3742,11 +3772,10 @@ def augment_customer_self_response(content: bytes, content_type: str) -> bytes:
     user = payload.get("data")
     if not isinstance(user, dict):
         return content
-    try:
-        user_id = int(user.get("id") or 0)
-        role = int(user.get("role") or 0)
-    except (TypeError, ValueError):
-        return content
+    # A huge/non-finite id (``1e999``/``10**30``) must not raise OverflowError;
+    # ``_safe_int`` collapses it to 0 which skips augmentation below.
+    user_id = _safe_int(user.get("id"))
+    role = _safe_int(user.get("role"))
     if user_id <= 0 or role >= ADMIN_ROLE:
         return content
 
