@@ -194,6 +194,11 @@ app = FastAPI(title="BTF Device Gateway")
 # protection when the caller is authenticated by a browser session cookie.
 STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
+# Sec-Fetch-Site values that indicate a non-cross-site browser context. Any
+# other value (cross-site, same-site) means the request was initiated by a
+# different origin and must not ride on ambient cookie authentication.
+_SEC_FETCH_SITE_SAME_ORIGIN = frozenset({"same-origin", "none"})
+
 
 def login_required(authorization: str | None) -> bool:
     """True when a state-changing request must prove same-origin.
@@ -231,6 +236,20 @@ def cross_origin_rejection(request: Request) -> HTTPException | None:
     forged cross-site POST always carries one. Bearer callers are never
     affected. This keeps the device-key ``/v1`` API, payment-gateway webhooks
     and server-to-server integrations working unchanged.
+
+    As a second, independent signal we consult ``Sec-Fetch-Site``, a
+    Fetch-Metadata header modern browsers attach themselves and which scripts
+    cannot forge. When Origin/Referer are both absent but ``Sec-Fetch-Site`` is
+    present and not one of ``same-origin``/``none``, the request is
+    cross-site and is rejected. This closes the gap where a browser omits
+    Origin but still labels the request cross-site, while a genuine
+    server-to-server call (which sends neither Origin/Referer nor
+    Sec-Fetch-Site) is not miskilled.
+
+    Browser support boundary: ``Sec-Fetch-Site`` is sent by Chromium-based
+    browsers and Firefox (>=90). Safari currently does not send it, so Safari
+    requests fall back to the Origin/Referer check above - the same coverage as
+    before this change, never weaker.
     """
     if request.method not in STATE_CHANGING_METHODS:
         return None
@@ -240,6 +259,9 @@ def cross_origin_rejection(request: Request) -> HTTPException | None:
         return None
     values = request_origins(request)
     if not values:
+        fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+        if fetch_site and fetch_site not in _SEC_FETCH_SITE_SAME_ORIGIN:
+            return HTTPException(status_code=403, detail="cross-origin request rejected")
         return None
     allowed = set(settings.allowed_origins)
     if any(normalize_origin(value) not in allowed for value in values):
@@ -1106,11 +1128,33 @@ def decode_image_b64(value: str) -> tuple[bytes, str]:
     return base64.b64decode(encoded, validate=False), content_type
 
 
+# Address space that is not globally routable but that ``ipaddress`` does not
+# (reliably) flag as private/reserved for every Python version. Listed
+# explicitly so the SSRF guard rejects them even if ``is_global`` semantics
+# differ. Includes CGNAT 100.64.0.0/10 (cloud metadata, e.g. aliyun
+# 100.100.100.200), the IETF protocol assignments 192.0.0.0/24, benchmarking
+# 198.18.0.0/15, reserved 240.0.0.0/4 and "this network" 0.0.0.0/8.
+_NON_PUBLIC_NETWORKS = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "0.0.0.0/8",
+        "100.64.0.0/10",
+        "192.0.0.0/24",
+        "198.18.0.0/15",
+        "240.0.0.0/4",
+    )
+)
+
+
 def is_public_ip(value: str) -> bool:
     """Return True only for globally routable unicast IP addresses.
 
     Rejects private/loopback/link-local/reserved/multicast/unspecified ranges,
     including IPv4-mapped IPv6 addresses (which are unwrapped and re-checked).
+    ``ip.is_global`` is the primary gate; an explicit deny-list additionally
+    covers special-purpose ranges that ``is_global`` may not classify
+    consistently across Python versions (notably CGNAT 100.64.0.0/10, which can
+    reach cloud metadata endpoints such as 100.100.100.200).
     """
     try:
         ip = ipaddress.ip_address(value.strip().strip("[]"))
@@ -1118,6 +1162,12 @@ def is_public_ip(value: str) -> bool:
         return False
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
+    if not ip.is_global:
+        return False
+    if isinstance(ip, ipaddress.IPv4Address):
+        for network in _NON_PUBLIC_NETWORKS:
+            if ip in network:
+                return False
     return not (
         ip.is_private
         or ip.is_loopback

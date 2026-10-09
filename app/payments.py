@@ -330,11 +330,21 @@ class WechatPayProvider:
             trade_state = str(payload.get("trade_state", "")).strip().upper()
             if not trade_state:
                 raise PaymentProviderError("微信支付回调缺少 trade_state")
-            appid = str(payload.get("appid") or "")
-            mchid = str(payload.get("mchid") or "")
-            if appid and appid != self.settings.wechat_app_id:
+            # appid/mchid must be present AND match our configuration. A
+            # callback missing either field is rejected outright (never
+            # "validate only if present"), so a crafted/misdirected payload
+            # cannot settle an order without proving it belongs to us.
+            raw_appid = payload.get("appid")
+            raw_mchid = payload.get("mchid")
+            if not raw_appid:
+                raise PaymentSignatureError("微信支付回调缺少 appid")
+            if not raw_mchid:
+                raise PaymentSignatureError("微信支付回调缺少 mchid")
+            appid = str(raw_appid)
+            mchid = str(raw_mchid)
+            if appid != self.settings.wechat_app_id:
                 raise PaymentSignatureError("微信支付回调 appid 不匹配")
-            if mchid and mchid != self.settings.wechat_mch_id:
+            if mchid != self.settings.wechat_mch_id:
                 raise PaymentSignatureError("微信支付回调 mchid 不匹配")
             amount_minor = int(payload["amount"]["total"])
             amount = _decimal(Decimal(amount_minor) / Decimal(100))
