@@ -46,13 +46,15 @@ unless the dashboard routes and device menu have been verified.
 PUBLIC_BASE_URL
 NEW_API_BASE_URL
 NEW_API_TOKEN
-INTERNAL_ADMIN_TOKEN
-BTF_ADMIN_USERNAME
-BTF_ADMIN_PASSWORD
 ```
 
 `NEW_API_TOKEN` is the internal server-side relay token. It must not be given
 to a customer or hardware client.
+
+`PUBLIC_BASE_URL` defaults to the local placeholder `http://127.0.0.1:8080`.
+Production MUST set it to the public HTTPS domain (see "Real payment
+activation" below). The gateway has no separate admin username/password or
+internal admin token; administrative access is the existing New API session.
 
 ### Local payment test
 

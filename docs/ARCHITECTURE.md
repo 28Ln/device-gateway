@@ -101,6 +101,5 @@ Repeated provider callbacks do not extend twice.
 ## Admin/customer endpoint behavior
 
 The dashboard uses the existing New API session cookie or access token. It does
-not use `INTERNAL_ADMIN_TOKEN`, `NEW_API_TOKEN`, or a separate BTF admin login.
-`INTERNAL_ADMIN_TOKEN` is reserved for server-side operations and is never sent
-to a browser.
+not use `NEW_API_TOKEN` or a separate BTF admin login. The gateway keeps no
+browser-facing admin credential of its own.

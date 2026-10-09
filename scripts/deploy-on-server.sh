@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR=${PROJECT_DIR:-/opt/btf-device-gateway}
 NEW_API_DIR=${NEW_API_DIR:-/opt/new-api}
-PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://115.191.10.45}
+PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://127.0.0.1:8080}
 
 cd "$PROJECT_DIR"
 
@@ -29,10 +29,6 @@ if [[ ! -f .env ]]; then
 PUBLIC_BASE_URL=$PUBLIC_BASE_URL
 NEW_API_BASE_URL=http://new-api:3000
 NEW_API_TOKEN=$relay_token
-INTERNAL_ADMIN_TOKEN=$(openssl rand -hex 32)
-BTF_ADMIN_USERNAME=admin
-BTF_ADMIN_PASSWORD=$(openssl rand -hex 20)
-PAYMENT_INSTRUCTIONS=请联系销售确认付款，订单确认后设备授权会自动延期。
 DEMO_PAYMENT_ENABLED=false
 MOCK_PAYMENT_SECRET=
 PAYMENT_NOTIFY_URL=

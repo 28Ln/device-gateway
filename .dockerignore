@@ -1,0 +1,30 @@
+# Version control
+.git
+.gitignore
+
+# Local runtime data / databases
+data/
+btf.db
+*.sqlite3
+*.sqlite3-journal
+
+# Build artifacts and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Frontend build assets (mounted as a volume at runtime)
+new-api-dist/
+new-api-dist.bak.*/
+
+# Local environment / secrets
+.env
+
+# Tests, tooling and docs not needed in the image
+tests/
+scripts/
+docs/
+requirements-dev.txt
