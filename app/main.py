@@ -528,10 +528,18 @@ async def resolve_dashboard_user(
                     headers={"cookie": cookie},
                 )
                 if refresh.status_code == 200:
-                    refresh_payload = refresh.json()
-                    access_token = str(
-                        (refresh_payload.get("data") or {}).get("access_token") or ""
+                    try:
+                        refresh_payload = refresh.json()
+                    except ValueError:
+                        refresh_payload = {}
+                    refresh_data = (
+                        refresh_payload.get("data")
+                        if isinstance(refresh_payload, dict)
+                        else None
                     )
+                    access_token = ""
+                    if isinstance(refresh_data, dict):
+                        access_token = str(refresh_data.get("access_token") or "")
                     if access_token:
                         upstream = await client.get(
                             f"{settings.new_api_base_url}/api/user/self",
@@ -544,7 +552,13 @@ async def resolve_dashboard_user(
         raise HTTPException(status_code=401, detail="invalid dashboard session")
     try:
         payload = upstream.json()
+        if not isinstance(payload, dict):
+            # A non-object upstream body (``[]``/``null``/...) must not reach
+            # ``.get`` and escape as a 500; reject as an invalid session.
+            raise ValueError("invalid dashboard session payload")
         user = payload.get("data") or {}
+        if not isinstance(user, dict):
+            raise ValueError("invalid dashboard session payload")
         user_id = int(user.get("id") or 0)
         role = int(user.get("role") or 0)
         username = str(user.get("username") or "")
@@ -581,6 +595,11 @@ def request_model_from_body(body: bytes) -> str:
     try:
         payload = json.loads(body.decode("utf-8"))
     except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        # Non-object JSON bodies (``[]``/``null``/``123``/``"str"``/``true``)
+        # carry no model; treat them as empty so callers emit a 4xx instead of
+        # an ``AttributeError`` -> 500 from ``payload.get``.
         return ""
     return str(payload.get("model") or "").strip()
 
@@ -932,7 +951,7 @@ def filter_models_response(content: bytes, content_type: str, device_id: str) ->
         payload = json.loads(content.decode("utf-8"))
     except Exception:
         return content
-    if not isinstance(payload.get("data"), list):
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         return content
     plan = plan_entitlements_for_device(device_id)
     data: list[dict[str, Any]] = []
@@ -1288,8 +1307,10 @@ async def persist_image_generation_response(
         payload = json.loads(content.decode("utf-8"))
     except Exception:
         return content
+    if not isinstance(payload, dict):
+        return content
     data = payload.get("data")
-    if not isinstance(payload, dict) or not isinstance(data, list):
+    if not isinstance(data, list):
         return content
     prompt = request_prompt_from_body(request_body)
     changed = False
@@ -1877,8 +1898,14 @@ async def api_create_device(
                     ts if user_id is not None else None,
                 ),
             )
+        except sqlite3.IntegrityError:
+            # A duplicate device_id/key surfaces only as a friendly message so
+            # the raw ``UNIQUE constraint failed: ...`` SQLite text is never
+            # echoed back to the client.
+            return {"success": False, "message": "device id already exists"}
         except Exception as exc:
-            return {"success": False, "message": str(exc)}
+            logger.warning("device create failed mac=%s error=%s", mac, exc)
+            return {"success": False, "message": "device could not be created"}
     return {
         "success": True,
         "message": "",
@@ -2006,12 +2033,13 @@ async def api_update_device(
                     device_id,
                 ),
             )
-        except sqlite3.IntegrityError as exc:
+        except sqlite3.IntegrityError:
             # Any remaining uniqueness violation (e.g. key_hash) is reported
             # generically so internal schema details are never echoed back.
             return {"success": False, "message": "device conflict"}
         except Exception as exc:
-            return {"success": False, "message": str(exc)}
+            logger.warning("device update failed id=%s error=%s", device_id, exc)
+            return {"success": False, "message": "device could not be updated"}
     return {"success": True, "message": "", "data": {"updated": True}}
 
 
@@ -2081,11 +2109,16 @@ async def api_batch_create_devices(
                 created += 1
                 if row_bind_code:
                     bind_codes[mac] = row_bind_code
-            except Exception as exc:
+            except sqlite3.IntegrityError:
                 # Keep the real per-device failure instead of silently
-                # reporting success for rejected inserts.
+                # reporting success for rejected inserts, but never echo the
+                # raw SQLite ``UNIQUE constraint`` text back to the client.
                 failed.append(mac)
-                failures.append({"mac": mac, "message": str(exc)})
+                failures.append({"mac": mac, "message": "device id already exists"})
+            except Exception as exc:
+                logger.warning("batch device create failed mac=%s error=%s", mac, exc)
+                failed.append(mac)
+                failures.append({"mac": mac, "message": "device could not be created"})
     return {
         "success": created > 0,
         "message": "" if not failures else "some devices could not be created",
@@ -3111,9 +3144,13 @@ def _require_mock_notify_device_key(
     device = get_device_by_key(settings.database_path, candidate)
     try:
         payload = json.loads(body.decode())
-        order_id = str(payload.get("order_id") or "")
     except (ValueError, json.JSONDecodeError):
         raise DeviceError("invalid mock notification payload")
+    if not isinstance(payload, dict):
+        # Non-object JSON (``[]``/``null``/``123``/``"str"``) must not reach
+        # ``payload.get`` and escape as an HTTP 500; treat as invalid payload.
+        raise DeviceError("invalid mock notification payload")
+    order_id = str(payload.get("order_id") or "")
     if not order_id:
         raise DeviceError("mock notification order_id is required")
     with connect(settings.database_path) as conn:
