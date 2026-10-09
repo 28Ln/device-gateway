@@ -327,6 +327,10 @@ def init_db(database_path: Path) -> None:
               where idempotency_key is not null
             """
         )
+        # Supports the throttled timeout sweep / order expiry lookups.
+        conn.execute(
+            "create index if not exists idx_orders_status_expires on orders(status, payment_expires_at)"
+        )
         for plan in DEFAULT_PLANS:
             conn.execute(
                 """

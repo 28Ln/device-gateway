@@ -30,6 +30,7 @@ class Settings:
     wechat_platform_public_key: str
     wechat_api_base_url: str
     alipay_app_id: str
+    alipay_seller_id: str
     alipay_private_key: str
     alipay_public_key: str
     alipay_gateway: str
@@ -73,6 +74,7 @@ def load_settings() -> Settings:
         wechat_platform_public_key=env_pem("WECHAT_PLATFORM_PUBLIC_KEY"),
         wechat_api_base_url=os.getenv("WECHAT_API_BASE_URL", "https://api.mch.weixin.qq.com").rstrip("/"),
         alipay_app_id=os.getenv("ALIPAY_APP_ID", ""),
+        alipay_seller_id=os.getenv("ALIPAY_SELLER_ID", ""),
         alipay_private_key=env_pem("ALIPAY_PRIVATE_KEY"),
         alipay_public_key=env_pem("ALIPAY_PUBLIC_KEY"),
         alipay_gateway=os.getenv("ALIPAY_GATEWAY", "https://openapi.alipay.com/gateway.do"),

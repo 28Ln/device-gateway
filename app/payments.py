@@ -54,6 +54,13 @@ class PaymentNotification:
     amount: Decimal
     currency: str
     raw_payload: str
+    # Provider-authoritative amount/currency used for settlement. For signed
+    # callbacks this mirrors the verified payload; the gateway must never trust
+    # an attacker-controlled body for the amount, so anything that derives the
+    # notification locally (e.g. the demo complete endpoint) fills these from
+    # the stored transaction instead.
+    authorized_amount: Decimal | None = None
+    authorized_currency: str | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -64,6 +71,11 @@ class PaymentNotification:
             "TRADE_SUCCESS",
             "TRADE_FINISHED",
         }
+
+
+# WeChat Pay callback timestamps must be recent; older/future ones are replay
+# attempts and are rejected.
+WECHAT_CALLBACK_MAX_SKEW_SECONDS = 300
 
 
 def _decimal(value: Any) -> Decimal:
@@ -171,14 +183,17 @@ class MockPaymentProvider:
         try:
             payload = json.loads(body.decode())
             amount = _decimal(payload["amount"])
+            currency = str(payload.get("currency", "CNY")).upper()
             return PaymentNotification(
                 provider=self.name,
                 order_id=str(payload["order_id"]),
                 provider_order_id=str(payload["provider_order_id"]),
                 status=str(payload.get("status", "paid")),
                 amount=amount,
-                currency=str(payload.get("currency", "CNY")).upper(),
+                currency=currency,
                 raw_payload=body.decode(),
+                authorized_amount=amount,
+                authorized_currency=currency,
             )
         except (KeyError, ValueError, json.JSONDecodeError) as exc:
             raise PaymentProviderError("invalid mock payment callback") from exc
@@ -290,6 +305,14 @@ class WechatPayProvider:
             raise PaymentSignatureError("微信支付回调缺少签名头")
         if serial and serial != self.settings.wechat_platform_serial_no:
             raise PaymentSignatureError("微信支付平台证书序列号不匹配")
+        # Replay protection: reject callbacks whose timestamp is missing,
+        # stale, or implausibly in the future.
+        try:
+            skew = abs(int(time.time()) - int(timestamp))
+        except (TypeError, ValueError) as exc:
+            raise PaymentSignatureError("微信支付回调时间戳无效") from exc
+        if skew > WECHAT_CALLBACK_MAX_SKEW_SECONDS:
+            raise PaymentSignatureError("微信支付回调时间戳超出允许窗口")
         message = f"{timestamp}\n{nonce}\n{body.decode()}\n"
         _rsa_verify(self.platform_public_key, message, signature)
         try:
@@ -302,15 +325,31 @@ class WechatPayProvider:
                 resource["associated_data"].encode(),
             )
             payload = json.loads(decrypted.decode())
-            amount = _decimal(Decimal(payload["amount"]["total"]) / Decimal(100))
+            # A missing trade_state must be treated as failure, never as
+            # success, so an incomplete/attacker-supplied payload cannot settle
+            # an order.
+            trade_state = str(payload.get("trade_state", "")).strip().upper()
+            if not trade_state:
+                raise PaymentProviderError("微信支付回调缺少 trade_state")
+            appid = str(payload.get("appid") or "")
+            mchid = str(payload.get("mchid") or "")
+            if appid and appid != self.settings.wechat_app_id:
+                raise PaymentSignatureError("微信支付回调 appid 不匹配")
+            if mchid and mchid != self.settings.wechat_mch_id:
+                raise PaymentSignatureError("微信支付回调 mchid 不匹配")
+            amount_minor = int(payload["amount"]["total"])
+            amount = _decimal(Decimal(amount_minor) / Decimal(100))
+            currency = str(payload["amount"].get("currency", "CNY")).upper()
             return PaymentNotification(
                 provider=self.name,
                 order_id=str(payload["out_trade_no"]),
                 provider_order_id=str(payload.get("transaction_id") or payload["out_trade_no"]),
-                status=str(payload.get("trade_state", "SUCCESS")),
+                status=trade_state,
                 amount=amount,
-                currency=str(payload["amount"].get("currency", "CNY")).upper(),
+                currency=currency,
                 raw_payload=decrypted.decode(),
+                authorized_amount=amount,
+                authorized_currency=currency,
             )
         except (KeyError, ValueError, json.JSONDecodeError) as exc:
             raise PaymentProviderError("微信支付回调内容无效") from exc
@@ -386,21 +425,39 @@ class AlipayProvider:
             for key, values in parse_qs(body.decode(), keep_blank_values=True).items()
         }
         signature = raw.pop("sign", "")
-        raw.pop("sign_type", None)
+        sign_type = raw.pop("sign_type", "")
         if not signature:
             raise PaymentSignatureError("支付宝回调缺少 sign")
+        # RSA2 (SHA256withRSA) is mandatory. A present-but-different sign_type is
+        # refused so the legacy SHA1/RSA path cannot be downgraded into; an
+        # absent sign_type is tolerated for compatibility but verification still
+        # always uses SHA256.
+        if str(sign_type).upper() not in {"", "RSA2"}:
+            raise PaymentSignatureError("支付宝回调 sign_type 必须为 RSA2")
         _rsa_verify(self.public_key, _alipay_signing_string(raw), signature)
+        app_id = raw.get("app_id", "")
+        if app_id and app_id != self.settings.alipay_app_id:
+            raise PaymentSignatureError("支付宝回调 app_id 不匹配")
+        seller_id = raw.get("seller_id", "")
+        if seller_id and getattr(self.settings, "alipay_seller_id", "") and (
+            seller_id != self.settings.alipay_seller_id
+        ):
+            raise PaymentSignatureError("支付宝回调 seller_id 不匹配")
         status = raw.get("trade_status", "")
         if status not in {"TRADE_SUCCESS", "TRADE_FINISHED"}:
             raise PaymentProviderError(f"支付宝订单未支付成功: {status}")
+        amount = _decimal(raw["total_amount"])
+        currency = raw.get("currency", "CNY").upper()
         return PaymentNotification(
             provider=self.name,
             order_id=raw["out_trade_no"],
             provider_order_id=raw.get("trade_no", raw["out_trade_no"]),
             status=status,
-            amount=_decimal(raw["total_amount"]),
-            currency=raw.get("currency", "CNY").upper(),
+            amount=amount,
+            currency=currency,
             raw_payload=json.dumps(raw, ensure_ascii=False, sort_keys=True),
+            authorized_amount=amount,
+            authorized_currency=currency,
         )
 
 

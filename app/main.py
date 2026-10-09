@@ -1993,11 +1993,22 @@ async def api_update_device_user_limits(
 
 
 @app.post("/api/device/payments/{provider_name}/notify")
-async def api_payment_notify(provider_name: str, request: Request) -> Response:
+async def api_payment_notify(
+    provider_name: str,
+    request: Request,
+    x_device_key: str | None = Header(default=None),
+) -> Response:
     body = await request.body()
     try:
         provider = get_payment_provider(provider_name, settings)
-        notification = provider.parse_notification(body, dict(request.headers))
+        headers = dict(request.headers)
+        # Real payment gateways sign each callback with the merchant/platform
+        # key, so a URL secret is unnecessary for them. The demo provider signs
+        # with a shared secret the client would otherwise have to embed, so we
+        # additionally require the order owner's device key to authorise it.
+        if provider_name.strip().lower() == "mock":
+            _require_mock_notify_device_key(request, x_device_key, body)
+        notification = provider.parse_notification(body, headers)
         order = apply_payment_notification(settings.database_path, notification)
     except PaymentNotConfigured as exc:
         return JSONResponse(status_code=503, content={"success": False, "message": str(exc)})
@@ -2011,11 +2022,53 @@ async def api_payment_notify(provider_name: str, request: Request) -> Response:
     )
 
 
+def _request_secret(request: Request, explicit_key: str | None) -> str:
+    if explicit_key:
+        return explicit_key.strip()
+    authorization = request.headers.get("authorization")
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization.split(" ", 1)[1].strip()
+    return ""
+
+
+def _require_mock_notify_device_key(
+    request: Request,
+    explicit_key: str | None,
+    body: bytes,
+) -> None:
+    candidate = _request_secret(request, explicit_key)
+    if not candidate:
+        raise DeviceError("mock notification requires a device key")
+    device = get_device_by_key(settings.database_path, candidate)
+    try:
+        payload = json.loads(body.decode())
+        order_id = str(payload.get("order_id") or "")
+    except (ValueError, json.JSONDecodeError):
+        raise DeviceError("invalid mock notification payload")
+    if not order_id:
+        raise DeviceError("mock notification order_id is required")
+    with connect(settings.database_path) as conn:
+        order = conn.execute(
+            "select device_id from orders where id = ?",
+            (order_id,),
+        ).fetchone()
+    if not order or order["device_id"] != device["device_id"]:
+        raise DeviceError("order does not belong to this device")
+
+
 @app.post("/api/device/payments/mock/complete/{provider_order_id}")
-async def api_complete_mock_payment(provider_order_id: str) -> dict[str, Any]:
+async def api_complete_mock_payment(
+    provider_order_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    # Demo-only endpoint. Hard 404 in production so the mock settlement path is
+    # unreachable when DEMO_PAYMENT_ENABLED is false.
     if not settings.demo_payment_enabled:
         raise HTTPException(status_code=404, detail="mock payment is disabled")
     try:
+        # Require the device key of the order's owner; without it anyone could
+        # settle someone else's order.
+        device = get_device_by_key(settings.database_path, bearer_token(authorization))
         provider = MockPaymentProvider(settings.mock_payment_secret)
         with connect(settings.database_path) as conn:
             row = conn.execute(
@@ -2025,8 +2078,14 @@ async def api_complete_mock_payment(provider_order_id: str) -> dict[str, Any]:
                 """,
                 (provider_order_id,),
             ).fetchone()
-        if not row:
-            raise PaymentProviderError("mock payment transaction not found")
+            if not row:
+                raise PaymentProviderError("mock payment transaction not found")
+            order = conn.execute(
+                "select device_id from orders where id = ?",
+                (row["order_id"],),
+            ).fetchone()
+        if not order or order["device_id"] != device["device_id"]:
+            raise DeviceError("order does not belong to this device")
         payload = {
             "order_id": row["order_id"],
             "provider_order_id": row["provider_order_id"],
@@ -2039,10 +2098,18 @@ async def api_complete_mock_payment(provider_order_id: str) -> dict[str, Any]:
             body,
             {"x-btf-signature": provider.sign_callback(settings.mock_payment_secret, payload)},
         )
-        order = apply_payment_notification(settings.database_path, notification)
+        # Settle against the stored transaction amount, not the request body.
+        settled = apply_payment_notification(
+            settings.database_path,
+            notification,
+            authorized_amount=row["amount"],
+            authorized_currency=row["currency"],
+        )
     except PaymentError as exc:
         return {"success": False, "message": str(exc)}
-    return {"success": True, "message": "", "data": order}
+    except DeviceError as exc:
+        return {"success": False, "message": str(exc)}
+    return {"success": True, "message": "", "data": settled}
 
 
 @app.get("/api/device/{device_id}")
