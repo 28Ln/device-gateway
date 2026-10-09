@@ -20,6 +20,14 @@ from app.security import generate_device_key, hash_key, mask_key
 EXPIRE_SWEEP_INTERVAL_SECONDS = 30
 _LAST_EXPIRE_SWEEP: dict[str, int] = {}
 
+# Upper bounds mirroring the Web API so the CLI and service layer reject the
+# same absurd inputs instead of overflowing SQLite INTEGER binding
+# (``days * 86400`` / ``limit`` must stay well inside int64). 36500 days (100
+# years) is far beyond any realistic business window while ``now + 36500*86400``
+# remains many orders of magnitude below ``2**63``.
+MAX_DEVICE_DAYS = 36500
+MAX_LIST_LIMIT = 100_000
+
 
 class DeviceError(Exception):
     pass
@@ -49,6 +57,23 @@ def parse_optional_int(value: str | int | None) -> int | None:
     if value is None or value == "":
         return None
     return int(value)
+
+
+def validate_days(days: int) -> None:
+    """Bound a day-count before it reaches ``days * 86400`` / SQLite.
+
+    A huge (or non-int / bool) value would either overflow the int64 binding or
+    persist an absurd ``expires_at``; both are rejected here with a ``ValueError``
+    so callers surface a friendly error instead of an ``OverflowError`` traceback.
+    """
+    if not isinstance(days, int) or isinstance(days, bool) or days <= 0 or days > MAX_DEVICE_DAYS:
+        raise ValueError(f"days must be between 1 and {MAX_DEVICE_DAYS}")
+
+
+def validate_limit(limit: int) -> None:
+    """Bound a list ``limit`` before it is bound into a SQL query."""
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0 or limit > MAX_LIST_LIMIT:
+        raise ValueError(f"limit must be between 0 and {MAX_LIST_LIMIT}")
 
 
 def ensure_ready(database_path: Path) -> None:
@@ -172,8 +197,7 @@ def create_device(
     device_key: str | None = None,
 ) -> tuple[str, dict]:
     validate_device_id(device_id)
-    if days <= 0:
-        raise ValueError("days must be greater than 0")
+    validate_days(days)
     if user_id is not None:
         get_user(database_path, user_id)
     # BTF devices authenticate with their stable hardware identifier by default,
@@ -305,6 +329,8 @@ def batch_create_devices(
         raise ValueError("prefix would create invalid device ids")
     if count <= 0:
         raise ValueError("count must be greater than 0")
+    # Fail fast before any DB access; each ``create_device`` call re-validates too.
+    validate_days(days)
     if user_id is not None:
         get_user(database_path, user_id)
     width = max(4, len(str(count)))
@@ -322,8 +348,7 @@ def import_devices(
     note: str = "",
     user_id: int | None = None,
 ) -> list[tuple[str, dict]]:
-    if days <= 0:
-        raise ValueError("days must be greater than 0")
+    validate_days(days)
     if user_id is not None:
         get_user(database_path, user_id)
     cleaned: list[str] = []
@@ -346,8 +371,7 @@ def import_devices(
 
 
 def renew_device(database_path: Path, device_id: str, days: int) -> dict:
-    if days <= 0:
-        raise ValueError("days must be greater than 0")
+    validate_days(days)
     ts = now_ts()
     with connect(database_path) as conn:
         row = conn.execute(
@@ -396,8 +420,7 @@ def enable_device(database_path: Path, device_id: str, days_if_expired: int = 30
     one the call fails and leaves the row untouched (non-active), which is the
     same "expiry wins" normalisation the HTTP ``action=enable`` path applies.
     """
-    if days_if_expired <= 0:
-        raise ValueError("days_if_expired must be greater than 0")
+    validate_days(days_if_expired)
     device = get_device(database_path, device_id)
     ts = now_ts()
     expires_at = device["expires_at"]
@@ -847,6 +870,7 @@ def list_orders(
     limit: int = 200,
     user_id: int | None = None,
 ) -> list[dict]:
+    validate_limit(limit)
     _maybe_expire_pending_orders(database_path)
     with connect(database_path) as conn:
         if user_id is None:
@@ -923,6 +947,7 @@ def list_usage(
     limit: int = 200,
     user_id: int | None = None,
 ) -> list[dict]:
+    validate_limit(limit)
     with connect(database_path) as conn:
         conditions: list[str] = []
         params: list[object] = []
