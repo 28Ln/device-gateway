@@ -1740,9 +1740,36 @@ async def api_update_device(
         plan = conn.execute("select id from plans where id = ? and enabled = 1", (plan_id,)).fetchone()
         if not plan:
             return {"success": False, "message": "plan not found"}
-        row = conn.execute("select id, user_id, plan_id from devices where id = ?", (device_id,)).fetchone()
+        row = conn.execute(
+            "select id, device_id, user_id, plan_id from devices where id = ?",
+            (device_id,),
+        ).fetchone()
         if not row:
             return {"success": False, "message": "device not found"}
+        current_device_id = str(row["device_id"] or "")
+        if mac != current_device_id:
+            # Renaming rewrites the primary business key that orders,
+            # usage_events and generated_images reference. Rather than leave
+            # dangling history (or silently fork it) we refuse renames once any
+            # history exists and tell the caller explicitly. Devices with no
+            # history are still free to be renamed.
+            history = conn.execute(
+                """
+                select
+                  exists(select 1 from usage_events where device_id = ?) as u,
+                  exists(select 1 from orders where device_id = ?) as o,
+                  exists(select 1 from generated_images where device_id = ?) as g
+                """,
+                (current_device_id, current_device_id, current_device_id),
+            ).fetchone()
+            if history and (history["u"] or history["o"] or history["g"]):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "cannot rename device with existing usage/order/image history; "
+                        "create a new device instead"
+                    ),
+                )
         plan_started_at = ts if str(row["plan_id"] or "") != plan_id else None
         old_user_id = int(row["user_id"] or 0)
         next_user_id = user_id or 0
@@ -1912,11 +1939,38 @@ async def api_manage_device(
     expires_at = int_or_400(payload.get("expires_at"), "expires_at")
     ts = now_ts()
     with connect(settings.database_path) as conn:
-        row = conn.execute("select device_id, status from devices where id = ?", (device_id,)).fetchone()
+        row = conn.execute(
+            "select device_id, status, expires_at from devices where id = ?",
+            (device_id,),
+        ).fetchone()
         if not row:
             return {"success": False, "message": "device not found"}
         if action == "enable":
-            conn.execute("update devices set status = 'active', updated_at = ? where id = ?", (ts, device_id))
+            # Enabling must never leave a device both ``active`` and already
+            # expired. If the stored expiry has lapsed, require the caller to
+            # extend it in the same request (renew semantics) to at least now.
+            current_expires_at = int(row["expires_at"] or 0)
+            if current_expires_at <= ts:
+                requested = int_or_400(payload.get("expires_at"), "expires_at")
+                if requested <= ts:
+                    return {
+                        "success": False,
+                        "message": "device has expired; provide expires_at in the future to enable it",
+                    }
+                conn.execute(
+                    """
+                    update devices
+                    set status = 'active', expires_at = ?, updated_at = ?,
+                        plan_started_at = ?
+                    where id = ?
+                    """,
+                    (requested, ts, ts, device_id),
+                )
+            else:
+                conn.execute(
+                    "update devices set status = 'active', updated_at = ? where id = ?",
+                    (ts, device_id),
+                )
         elif action == "disable":
             conn.execute("update devices set status = 'disabled', updated_at = ? where id = ?", (ts, device_id))
         elif action == "renew":
@@ -2260,6 +2314,15 @@ async def api_list_device_images(
 
 
 def user_usage_rows(user_id: int | None = None) -> list[dict[str, Any]]:
+    """Per-user usage aggregates for the admin/customer usage views.
+
+    A usage row is attributed to its device owner whenever ``e.user_id`` is
+    NULL (legacy rows written before the column existed, or rows recorded while
+    a device was unbound). This ``coalesce(e.user_id, d.user_id)`` rule is the
+    same one used by ``/api/log/self`` and the window/summary helpers, so the
+    two endpoints now report identical numbers instead of this view silently
+    dropping NULL-owner history.
+    """
     params: list[Any] = []
     where = ""
     if user_id is not None:
@@ -2280,7 +2343,8 @@ def user_usage_rows(user_id: int | None = None) -> list[dict[str, Any]]:
                    coalesce(sum(case when e.created_at >= ? then e.total_tokens else 0 end), 0) as daily_tokens,
                    coalesce(sum(case when e.created_at >= ? then e.estimated_cost else 0 end), 0) as daily_estimated_cost
             from users u
-            left join usage_events e on e.user_id = u.id
+            left join devices d on d.user_id = u.id
+            left join usage_events e on coalesce(e.user_id, d.user_id) = u.id
             {where}
             group by u.id
             order by total_tokens desc, request_count desc, u.id
