@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
+
+logger = logging.getLogger("btf_device_gateway")
 
 # Single source of truth for the public base URL default. This is a safe local
 # placeholder only; production MUST override it via the PUBLIC_BASE_URL env var.
@@ -13,9 +16,19 @@ DEFAULT_PUBLIC_BASE_URL = "http://127.0.0.1:8080"
 # How long a signed ``/device-images/...`` link stays valid. Kept short so a
 # leaked URL (referer, logs, screenshots) cannot be replayed indefinitely, while
 # still covering a browser session. Validated to >= 60s so a typo cannot make
-# freshly generated images unreadable.
+# freshly generated images unreadable, and bounded above by 30 days so a bad
+# value cannot mint effectively-permanent signed links.
 DEFAULT_IMAGE_URL_TTL_SECONDS = 86400
 MIN_IMAGE_URL_TTL_SECONDS = 60
+MAX_IMAGE_URL_TTL_SECONDS = 30 * 24 * 60 * 60
+
+# Defaults/limits for the numeric env vars parsed below. Kept as module
+# constants so a malformed or out-of-range value can fall back to exactly the
+# same number as an unset one. The order-expiry ceiling is derived from a ~100
+# year window, which also keeps ``now + ttl`` inside SQLite's signed 64-bit
+# integer range so the value can always be bound to a query.
+DEFAULT_ORDER_EXPIRES_SECONDS = 86400
+MAX_ORDER_EXPIRES_SECONDS = 100 * 365 * 24 * 60 * 60
 
 
 def env_str(name: str, default: str = "") -> str:
@@ -132,16 +145,45 @@ def env_log_level(name: str = "BTF_LOG_LEVEL", default: str = "INFO") -> str:
     return value if value in _VALID_LOG_LEVELS else default
 
 
-def env_positive_int(name: str, default: int, minimum: int = 1) -> int:
-    """Return a positive integer env var, ignoring unset/blank/non-numeric input."""
+def env_positive_int(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
+    """Return a positive integer env var, ignoring unset/blank/non-numeric input.
+
+    Malformed input (non-numeric, too small or, when ``maximum`` is given, too
+    large) falls back to ``default`` rather than raising, so a typo can never
+    crash startup. Every fallback is logged so operators notice the mistake.
+    """
     raw = env_str(name)
     if not raw:
         return default
     try:
         value = int(raw)
     except ValueError:
+        logger.warning("invalid %s=%r; using default %r", name, raw, default)
         return default
-    return value if value >= minimum else default
+    if value < minimum or (maximum is not None and value > maximum):
+        logger.warning("out-of-range %s=%r; using default %r", name, raw, default)
+        return default
+    return value
+
+
+def env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    """Return a non-negative float env var, ignoring unset/blank/non-numeric input.
+
+    A malformed value falls back to ``default`` (and is logged) instead of
+    letting ``float()`` raise during ``load_settings`` and crash startup.
+    """
+    raw = env_str(name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("invalid %s=%r; using default %r", name, raw, default)
+        return default
+    if value != value or value < minimum:  # NaN is unordered; reject it too.
+        logger.warning("out-of-range %s=%r; using default %r", name, raw, default)
+        return default
+    return value
 
 
 def env_pem(name: str) -> str:
@@ -204,17 +246,24 @@ def load_settings() -> Settings:
         alipay_private_key=env_pem("ALIPAY_PRIVATE_KEY"),
         alipay_public_key=env_pem("ALIPAY_PUBLIC_KEY"),
         alipay_gateway=env_str("ALIPAY_GATEWAY", "https://openapi.alipay.com/gateway.do"),
-        chat_prompt_cost_per_million=float(env_str("BTF_CHAT_PROMPT_COST_PER_MILLION", "0") or 0),
-        chat_completion_cost_per_million=float(env_str("BTF_CHAT_COMPLETION_COST_PER_MILLION", "0") or 0),
-        image_cost_per_request=float(env_str("BTF_IMAGE_COST_PER_REQUEST", "0") or 0),
-        order_expires_seconds=int(env_str("BTF_ORDER_EXPIRES_SECONDS", "86400") or 86400),
+        chat_prompt_cost_per_million=env_float("BTF_CHAT_PROMPT_COST_PER_MILLION", 0.0),
+        chat_completion_cost_per_million=env_float(
+            "BTF_CHAT_COMPLETION_COST_PER_MILLION", 0.0
+        ),
+        image_cost_per_request=env_float("BTF_IMAGE_COST_PER_REQUEST", 0.0),
+        order_expires_seconds=env_positive_int(
+            "BTF_ORDER_EXPIRES_SECONDS",
+            DEFAULT_ORDER_EXPIRES_SECONDS,
+            maximum=MAX_ORDER_EXPIRES_SECONDS,
+        ),
         image_url_signing_key=env_str("BTF_IMAGE_URL_SIGNING_KEY")
         or _derived_image_signing_key(data_dir),
-        image_url_ttl_seconds=max(
-            MIN_IMAGE_URL_TTL_SECONDS,
-            int(
-                env_str("BTF_IMAGE_URL_TTL_SECONDS", str(DEFAULT_IMAGE_URL_TTL_SECONDS))
-                or DEFAULT_IMAGE_URL_TTL_SECONDS
+        image_url_ttl_seconds=min(
+            MAX_IMAGE_URL_TTL_SECONDS,
+            env_positive_int(
+                "BTF_IMAGE_URL_TTL_SECONDS",
+                DEFAULT_IMAGE_URL_TTL_SECONDS,
+                minimum=MIN_IMAGE_URL_TTL_SECONDS,
             ),
         ),
         log_level=env_log_level(),

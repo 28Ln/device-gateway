@@ -106,6 +106,12 @@ MAX_GENERATED_IMAGE_BYTES = 25 * 1024 * 1024
 # unusually large epoch cannot produce a nonsensical "forever" licence.
 MAX_EXPIRES_AT = 4_102_444_800
 MAX_PAGE_SIZE = 200
+# SQLite stores integers as signed 64-bit; a value outside this range raises
+# OverflowError when bound to a query, so it must be rejected at the edge.
+SQLITE_INT_MIN = -(2 ** 63)
+SQLITE_INT_MAX = 2 ** 63 - 1
+# Chosen so ``(MAX_PAGE - 1) * MAX_PAGE_SIZE`` (the largest OFFSET) still fits
+# comfortably inside a signed 64-bit integer.
 MAX_PAGE = 1_000_000
 DEVICE_STATUSES = ("active", "disabled", "expired")
 # Cache the expensive device authentication so the /v1/models early path does
@@ -1499,6 +1505,73 @@ def clamp_page_bounds(p: int, page_size: int) -> tuple[int, int]:
     return p, page_size
 
 
+def clamp_page(p: Any) -> int:
+    """Clamp a raw page index into ``[1, MAX_PAGE]``.
+
+    Deliberately lenient (unlike :func:`clamp_page_bounds`): booking-style
+    clients send junk here and the legacy ``/api/log/self`` contract is to keep
+    a page parameter, so non-numeric/oversized input is saturated at the
+    boundary instead of raising. Never raises, so it cannot turn into a 500.
+    """
+    try:
+        value = int(p)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(value, MAX_PAGE))
+
+
+def int_query_or_400(request: Request, name: str, default: int = 0) -> int:
+    """Parse an integer path/query parameter, rejecting malformed input with 400.
+
+    Reads the raw value from the URL (path parameter first, then query string).
+    Unlike FastAPI's implicit ``int`` conversion (which silently returns 422 for
+    junk) this also rejects values outside SQLite's signed 64-bit range, so an
+    absurdly large integer cannot reach a SQL binding and raise OverflowError
+    (HTTP 500) inside the query.
+    """
+    raw = request.path_params.get(name)
+    if raw is None:
+        raw = request.query_params.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid {name}") from exc
+    if value < SQLITE_INT_MIN or value > SQLITE_INT_MAX:
+        raise HTTPException(status_code=400, detail=f"invalid {name}")
+    return value
+
+
+def bounded_limit(value: int, default: int = 200, maximum: int = 1000) -> int:
+    """Clamp a list ``limit`` query parameter into ``[1, maximum]``.
+
+    Non-positive input keeps the historical "default" behaviour while an
+    oversized value is capped, so a huge integer can never reach a SQL binding.
+    """
+    if value <= 0:
+        return default
+    return min(value, maximum)
+
+
+def bounded_query_int(request: Request, name: str, minimum: int = 0, maximum: int = SQLITE_INT_MAX) -> int:
+    """Leniently parse an optional integer query parameter into ``[minimum, maximum]``.
+
+    Unlike :func:`int_query_or_400` this never raises: junk falls back to
+    ``minimum`` and out-of-range values are saturated. Intended for optional
+    filters (timestamps) where leniency is preferred and clamping is enough to
+    keep the value bindable (no OverflowError).
+    """
+    raw = request.query_params.get(name)
+    if raw is None or raw.strip() == "":
+        return minimum
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return minimum
+    return max(minimum, min(value, maximum))
+
+
 def normalized_device_statuses(status: str) -> list[str]:
     """Split a status filter into known statuses, rejecting unknown ones.
 
@@ -1538,14 +1611,19 @@ async def api_list_devices(
     authorization: str | None = Header(default=None),
     keyword: str = "",
     status: str = "",
-    user_id: int = 0,
+    user_id: Any = None,
     sort_by: str = "id",
     sort_order: str = "desc",
-    p: int = 1,
-    page_size: int = 20,
+    p: Any = None,
+    page_size: Any = None,
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
-    p, page_size = clamp_page_bounds(p, page_size)
+    # Parse the numeric query parameters ourselves so malformed or oversized
+    # values answer 400 instead of a framework 422 or an OverflowError 500.
+    parsed_page = int_query_or_400(request, "p", 1)
+    parsed_page_size = int_query_or_400(request, "page_size", 20)
+    p, page_size = clamp_page_bounds(parsed_page, parsed_page_size)
+    user_id = int_query_or_400(request, "user_id", 0)
     statuses = normalized_device_statuses(status)
     where: list[str] = []
     params: list[Any] = []
@@ -2075,9 +2153,10 @@ async def api_list_device_orders(
     authorization: str | None = Header(default=None),
     keyword: str = "",
     status: str = "",
-    limit: int = 200,
+    limit: Any = None,
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
+    limit = bounded_limit(int_query_or_400(request, "limit", 200))
     items = list_orders(
         settings.database_path,
         limit,
@@ -2228,9 +2307,10 @@ async def api_list_device_usage(
     request: Request,
     authorization: str | None = Header(default=None),
     device_id: str = "",
-    limit: int = 200,
+    limit: Any = None,
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
+    limit = bounded_limit(int_query_or_400(request, "limit", 200))
     items = list_usage(
         settings.database_path,
         normalize_mac(device_id) or None,
@@ -2245,9 +2325,10 @@ async def api_list_device_images(
     request: Request,
     authorization: str | None = Header(default=None),
     device_id: str = "",
-    limit: int = 200,
+    limit: Any = None,
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
+    limit = bounded_limit(int_query_or_400(request, "limit", 200), maximum=500)
     items = list_generated_images(
         settings.database_path,
         normalize_mac(device_id) or None,
@@ -2304,14 +2385,8 @@ def btf_usage_where(
     params: list[Any] = [user_id]
     query = request.query_params
 
-    try:
-        start_timestamp = int(query.get("start_timestamp") or 0)
-    except ValueError:
-        start_timestamp = 0
-    try:
-        end_timestamp = int(query.get("end_timestamp") or 0)
-    except ValueError:
-        end_timestamp = 0
+    start_timestamp = bounded_query_int(request, "start_timestamp")
+    end_timestamp = bounded_query_int(request, "end_timestamp")
     if start_timestamp > 0:
         conditions.append("e.created_at >= ?")
         params.append(start_timestamp)
@@ -2540,12 +2615,9 @@ async def api_customer_usage_logs(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
+    page = clamp_page(request.query_params.get("p"))
     try:
-        page = max(int(request.query_params.get("p") or 1), 1)
-    except ValueError:
-        page = 1
-    try:
-        page_size = max(min(int(request.query_params.get("page_size") or 20), 200), 1)
+        page_size = max(min(int(request.query_params.get("page_size") or 20), MAX_PAGE_SIZE), 1)
     except ValueError:
         page_size = 20
     start = (page - 1) * page_size
@@ -2907,6 +2979,7 @@ async def api_get_device(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
+    device_id = int_query_or_400(request, "device_id", device_id)
     with connect(settings.database_path) as conn:
         row = conn.execute(
             """
