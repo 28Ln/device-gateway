@@ -66,6 +66,11 @@ def _immediate(database_path: Path) -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(database_path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.isolation_level = None
+    # Match ``db.connect``: ``foreign_keys`` is a per-connection pragma and a
+    # no-op inside a transaction, so it must be set here too or this write path
+    # would silently bypass FK protection (dangling device/order references).
+    conn.execute("pragma busy_timeout=5000")
+    conn.execute("pragma foreign_keys=on")
     try:
         conn.execute("begin immediate")
         yield conn
