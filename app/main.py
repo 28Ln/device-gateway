@@ -1452,15 +1452,35 @@ def mask_bind_code(value: str) -> str:
 
 
 def int_or_400(value: Any, field: str) -> int:
-    """Parse an integer payload field, rejecting malformed input with 400."""
+    """Parse an integer payload field, rejecting malformed input with 400.
+
+    Also rejects values outside SQLite's signed 64-bit range: binding such a
+    value in a query raises ``OverflowError`` (HTTP 500), so an absurdly large
+    integer in any JSON body must be turned into a 400 at the edge.
+    """
     try:
-        return int(value or 0)
+        parsed = int(value or 0)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"invalid {field}") from exc
+    if parsed < SQLITE_INT_MIN or parsed > SQLITE_INT_MAX:
+        raise HTTPException(status_code=400, detail=f"invalid {field}")
+    return parsed
+
+
+def non_negative_int_or_400(value: Any, field: str) -> int:
+    """Parse an integer payload field that must not be negative.
+
+    Used for user ids: a negative id is never a valid reference and would
+    otherwise be silently coerced to ``None`` by :func:`optional_user_id`.
+    """
+    parsed = int_or_400(value, field)
+    if parsed < 0:
+        raise HTTPException(status_code=400, detail=f"invalid {field}")
+    return parsed
 
 
 def optional_user_id(value: Any) -> int | None:
-    user_id = int_or_400(value, "user_id")
+    user_id = non_negative_int_or_400(value, "user_id")
     return user_id if user_id > 0 else None
 
 
@@ -1673,7 +1693,12 @@ async def api_list_devices(
     parsed_page = int_query_or_400(request, "p", 1)
     parsed_page_size = int_query_or_400(request, "page_size", 20)
     p, page_size = clamp_page_bounds(parsed_page, parsed_page_size)
-    user_id = int_query_or_400(request, "user_id", 0)
+    parsed_user_id = int_query_or_400(request, "user_id", 0)
+    if parsed_user_id < 0:
+        # A negative id is never a valid filter; reject it instead of silently
+        # treating it as "no filter" and returning every device.
+        raise HTTPException(status_code=400, detail="invalid user_id")
+    user_id = parsed_user_id
     statuses = normalized_device_statuses(status)
     where: list[str] = []
     params: list[Any] = []
@@ -2085,6 +2110,8 @@ async def api_manage_device(
                         "success": False,
                         "message": "device has expired; provide expires_at in the future to enable it",
                     }
+                # Same upper bound as renew: an absurd epoch must not be stored.
+                requested = positive_expires_at(requested, "expires_at")
                 conn.execute(
                     """
                     update devices
