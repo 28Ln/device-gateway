@@ -34,6 +34,10 @@ services:
       ALIPAY_PRIVATE_KEY: ${ALIPAY_PRIVATE_KEY:-}
       ALIPAY_PUBLIC_KEY: ${ALIPAY_PUBLIC_KEY:-}
       ALIPAY_GATEWAY: ${ALIPAY_GATEWAY:-https://openapi.alipay.com/gateway.do}
+      # Observability + payment callback throttling (safe defaults apply if unset).
+      BTF_LOG_LEVEL: ${BTF_LOG_LEVEL:-INFO}
+      BTF_PAYMENT_NOTIFY_RATE_LIMIT: ${BTF_PAYMENT_NOTIFY_RATE_LIMIT:-60}
+      BTF_PAYMENT_NOTIFY_MAX_BODY_BYTES: ${BTF_PAYMENT_NOTIFY_MAX_BODY_BYTES:-262144}
     ports:
       - "80:8080"
     volumes:

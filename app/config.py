@@ -50,6 +50,31 @@ class Settings:
     chat_completion_cost_per_million: float
     image_cost_per_request: float
     order_expires_seconds: int
+    log_level: str
+    payment_notify_rate_limit: int
+    payment_notify_max_body_bytes: int
+
+
+# Recognised logging levels. An unknown/blank value falls back to INFO so a typo
+# can never silence the gateway's operational logs.
+_VALID_LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
+
+
+def env_log_level(name: str = "BTF_LOG_LEVEL", default: str = "INFO") -> str:
+    value = env_str(name, default).upper()
+    return value if value in _VALID_LOG_LEVELS else default
+
+
+def env_positive_int(name: str, default: int, minimum: int = 1) -> int:
+    """Return a positive integer env var, ignoring unset/blank/non-numeric input."""
+    raw = env_str(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= minimum else default
 
 
 def env_pem(name: str) -> str:
@@ -86,4 +111,10 @@ def load_settings() -> Settings:
         chat_completion_cost_per_million=float(env_str("BTF_CHAT_COMPLETION_COST_PER_MILLION", "0") or 0),
         image_cost_per_request=float(env_str("BTF_IMAGE_COST_PER_REQUEST", "0") or 0),
         order_expires_seconds=int(env_str("BTF_ORDER_EXPIRES_SECONDS", "86400") or 86400),
+        log_level=env_log_level(),
+        # Process-local callback throttle: N callbacks per window (see main.py).
+        payment_notify_rate_limit=env_positive_int("BTF_PAYMENT_NOTIFY_RATE_LIMIT", 60),
+        payment_notify_max_body_bytes=env_positive_int(
+            "BTF_PAYMENT_NOTIFY_MAX_BODY_BYTES", 256 * 1024
+        ),
     )

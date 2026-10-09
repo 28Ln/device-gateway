@@ -153,6 +153,24 @@ IMAGE_DOWNLOAD_ALLOWED_SCHEMES = {"http", "https"}
 logger = logging.getLogger("btf_device_gateway")
 
 
+def configure_logging(level: str | None = None) -> None:
+    """Attach a handler and apply the configured level to our logger.
+
+    Level comes from ``BTF_LOG_LEVEL`` (validated in config). We only touch this
+    service's own logger to avoid clobbering the host application's logging.
+    """
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        )
+        logger.addHandler(handler)
+    logger.setLevel(getattr(logging, (level or settings.log_level).upper(), logging.INFO))
+
+
+configure_logging()
+
+
 @dataclass(frozen=True)
 class DashboardUser:
     id: int
@@ -164,6 +182,123 @@ class DashboardUser:
         return self.role >= ADMIN_ROLE
 
 app = FastAPI(title="BTF Device Gateway")
+
+
+REQUEST_ID_HEADER = "X-Request-ID"
+# Only echo back client-supplied IDs that look like plausible request
+# identifiers, so an attacker cannot inject arbitrary text into our logs or the
+# response header (log forging / header abuse).
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._~:-]{1,128}$")
+
+
+_SAFE_LOG_FIELD_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _safe_log(value: str) -> str:
+    """Strip control characters so request paths cannot forge log lines."""
+    return _SAFE_LOG_FIELD_RE.sub(" ", str(value))
+
+
+def _incoming_request_id(header_value: str | None) -> str | None:
+    if header_value and _REQUEST_ID_RE.match(header_value.strip()):
+        return header_value.strip()
+    return None
+
+
+async def request_id_middleware(request: Request, call_next: Callable) -> Response:
+    """Assign/propagate ``X-Request-ID`` and emit one structured access log.
+
+    A client-supplied ID is reused only when it matches a safe charset, so the
+    same value can be correlated through the logs and the upstream call without
+    allowing log/header injection. The access log records method, path, status,
+    duration, resolved device and upstream timing (the proxy helpers stash the
+    latter on ``request.state``).
+    """
+    request_id = _incoming_request_id(request.headers.get(REQUEST_ID_HEADER)) or f"req-{secrets.token_hex(12)}"
+    request.state.request_id = request_id
+    started = time.monotonic()
+    try:
+        response = await call_next(request)
+    except Exception:
+        # Unhandled failures still get a correlated log line before the error
+        # propagates to Starlette's default handler.
+        logger.error(
+            "request failed method=%s path=%s request_id=%s duration_ms=%.1f",
+            request.method,
+            _safe_log(request.url.path),
+            request_id,
+            (time.monotonic() - started) * 1000.0,
+        )
+        raise
+    response.headers[REQUEST_ID_HEADER] = request_id
+    upstream_latency = getattr(request.state, "upstream_latency_ms", None)
+    device_id = getattr(request.state, "log_device_id", "") or ""
+    logger.info(
+        "request method=%s path=%s status=%s duration_ms=%.1f device=%s "
+        "upstream_ms=%s request_id=%s",
+        request.method,
+        _safe_log(request.url.path),
+        response.status_code,
+        (time.monotonic() - started) * 1000.0,
+        device_id,
+        f"{upstream_latency:.1f}" if isinstance(upstream_latency, (int, float)) else "-",
+        request_id,
+    )
+    return response
+
+
+app.middleware("http")(request_id_middleware)
+
+
+# --- Payment callback throttling -------------------------------------------
+# Process-local token bucket keyed by client IP. This bounds the damage a single
+# source can do to the payment callback/notify endpoints. It is intentionally
+# in-process: behind multiple workers / replicas each worker keeps its own
+# budget, so the effective limit is multiplied by the worker count. A shared
+# limiter (Redis) would be needed for a globally exact limit.
+PAYMENT_NOTIFY_RATE_WINDOW = 60.0
+
+
+class TokenBucketLimiter:
+    def __init__(self, capacity: int, window_seconds: float) -> None:
+        self.capacity = max(int(capacity), 1)
+        self.window = max(float(window_seconds), 1.0)
+        self._buckets: dict[str, tuple[float, float]] = {}
+
+    def allow(self, key: str) -> bool:
+        now = time.monotonic()
+        tokens, last = self._buckets.get(key, (float(self.capacity), now))
+        tokens = min(float(self.capacity), tokens + (now - last) * self.capacity / self.window)
+        if tokens < 1.0:
+            self._buckets[key] = (tokens, now)
+            return False
+        self._buckets[key] = (tokens - 1.0, now)
+        # Opportunistic cleanup so the dict cannot grow without bound.
+        if len(self._buckets) > 4096:
+            cutoff = now - self.window
+            for bucket_key, (_, seen) in list(self._buckets.items()):
+                if seen < cutoff:
+                    self._buckets.pop(bucket_key, None)
+        return True
+
+
+payment_notify_limiter = TokenBucketLimiter(
+    settings.payment_notify_rate_limit,
+    PAYMENT_NOTIFY_RATE_WINDOW,
+)
+
+
+def check_payment_callback_limits(request: Request) -> Response | None:
+    """Return a generic 429 when a payment callback is rate limited."""
+    client_host = request.client.host if request.client else "unknown"
+    if not payment_notify_limiter.allow(client_host):
+        logger.warning("payment callback rate limited client=%s", client_host)
+        return JSONResponse(
+            status_code=429,
+            content={"success": False, "message": "too many requests"},
+            headers={"Retry-After": str(int(PAYMENT_NOTIFY_RATE_WINDOW))},
+        )
+    return None
 
 
 def fmt_ts(value: int | None) -> str:
@@ -2375,13 +2510,47 @@ async def api_update_device_user_limits(
     return {"success": True, "message": "", "data": user_usage_rows(user_id)[0]}
 
 
+async def _read_capped_callback_body(request: Request) -> bytes | None:
+    """Read a callback body, rejecting anything over the configured cap.
+
+    A declared ``Content-Length`` over the cap is rejected before reading; the
+    actual body length is checked too in case the header is missing or forged.
+    Returns ``None`` when the body is too large (caller answers generically).
+    """
+    cap = settings.payment_notify_max_body_bytes
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > cap:
+                return None
+        except ValueError:
+            return None
+    body = await request.body()
+    if len(body) > cap:
+        return None
+    return body
+
+
+def _callback_body_too_large() -> JSONResponse:
+    # Generic error: no length, limit or other internal detail is echoed back.
+    return JSONResponse(
+        status_code=413,
+        content={"success": False, "message": "request entity too large"},
+    )
+
+
 @app.post("/api/device/payments/{provider_name}/notify")
 async def api_payment_notify(
     provider_name: str,
     request: Request,
     x_device_key: str | None = Header(default=None),
 ) -> Response:
-    body = await request.body()
+    limited = check_payment_callback_limits(request)
+    if limited is not None:
+        return limited
+    body = await _read_capped_callback_body(request)
+    if body is None:
+        return _callback_body_too_large()
     try:
         provider = get_payment_provider(provider_name, settings)
         headers = dict(request.headers)
@@ -2442,12 +2611,20 @@ def _require_mock_notify_device_key(
 @app.post("/api/device/payments/mock/complete/{provider_order_id}")
 async def api_complete_mock_payment(
     provider_order_id: str,
+    request: Request,
     authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
+) -> Response:
     # Demo-only endpoint. Hard 404 in production so the mock settlement path is
     # unreachable when DEMO_PAYMENT_ENABLED is false.
     if not settings.demo_payment_enabled:
         raise HTTPException(status_code=404, detail="mock payment is disabled")
+    # Same protections as the real callback endpoints: throttle abusive callers
+    # and refuse oversized bodies with a generic error before touching the DB.
+    limited = check_payment_callback_limits(request)
+    if limited is not None:
+        return limited
+    if await _read_capped_callback_body(request) is None:
+        return _callback_body_too_large()
     try:
         # Require the device key of the order's owner; without it anyone could
         # settle someone else's order.
@@ -2769,6 +2946,7 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
     # so that an upstream that answers with text/event-stream can be relayed
     # chunk-by-chunk without ever materialising the whole body.
     client = stream_client() if wants_stream else upstream_client()
+    upstream_started = time.monotonic()
     try:
         upstream_request = client.build_request(
             request.method,
@@ -2778,9 +2956,25 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
             headers=headers,
         )
         upstream = await client.send(upstream_request, stream=True)
-    except BaseException:
+    except BaseException as exc:
+        _record_upstream_timing(
+            request,
+            auth.device_id,
+            f"/v1/{clean_path}",
+            0,
+            (time.monotonic() - upstream_started) * 1000.0,
+        )
+        logger.warning("upstream request failed path=/v1/%s error=%s", clean_path, exc)
         _release_active_request(auth.device_id, user_id)
         raise
+    _record_upstream_timing(
+        request,
+        auth.device_id,
+        f"/v1/{clean_path}",
+        upstream.status_code,
+        (time.monotonic() - upstream_started) * 1000.0,
+        streamed=upstream_response_is_stream(upstream),
+    )
     content_type = upstream.headers.get("content-type", "")
 
     if upstream.status_code < 400 and upstream_response_is_stream(upstream):
@@ -2808,6 +3002,7 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
                 plan_id,
                 requested_model,
                 upstream_model,
+                upstream.status_code,
             ),
         )
 
@@ -2842,6 +3037,41 @@ def _release_active_request(device_id: str, user_id: int | None) -> None:
         ACTIVE_USER_REQUESTS[user_id] = max(ACTIVE_USER_REQUESTS.get(user_id, 1) - 1, 0)
         if ACTIVE_USER_REQUESTS[user_id] == 0:
             ACTIVE_USER_REQUESTS.pop(user_id, None)
+
+
+def _record_upstream_timing(
+    request: Request,
+    device_id: str,
+    path: str,
+    status_code: int,
+    latency_ms: float | None,
+    streamed: bool = False,
+) -> None:
+    """Log upstream status/latency at a level graded by the response class.
+
+    4xx/5xx upstream responses are logged at WARNING (with the request id for
+    correlation); successes at INFO. Also stashes the device and latency on
+    ``request.state`` so the access-log middleware can include them.
+    """
+    request.state.log_device_id = device_id
+    if latency_ms is not None:
+        request.state.upstream_latency_ms = latency_ms
+    request_id = getattr(request.state, "request_id", "-")
+    if status_code >= 400:
+        level = logging.WARNING
+    else:
+        level = logging.INFO
+    logger.log(
+        level,
+        "upstream %s path=%s status=%s latency_ms=%s device=%s streamed=%s request_id=%s",
+        request.method,
+        path,
+        status_code,
+        f"{latency_ms:.1f}" if latency_ms is not None else "-",
+        device_id,
+        streamed,
+        request_id,
+    )
 
 
 async def _record_and_build_response(
@@ -2913,6 +3143,7 @@ async def _finalize_stream_usage(
     plan_id: str,
     requested_model: str,
     upstream_model: str,
+    status_code: int = 200,
 ) -> None:
     """Record usage for a streamed response after all bytes were forwarded.
 
@@ -2922,12 +3153,16 @@ async def _finalize_stream_usage(
     """
     raw = bytes(stream_buffer[0]) if stream_buffer else b""
     prompt, completion, total = extract_stream_usage(raw.decode("utf-8", "replace"))
-    estimated_cost = estimated_request_cost(clean_path, prompt, completion, upstream_model)
+    estimated_cost = (
+        0.0
+        if status_code >= 400
+        else estimated_request_cost(clean_path, prompt, completion, upstream_model)
+    )
     record_usage(
         settings.database_path,
         device_id,
         f"/v1/{clean_path}",
-        200,
+        status_code,
         prompt,
         completion,
         total,
@@ -3025,14 +3260,26 @@ async def proxy_new_api(path: str, request: Request) -> Response:
     body = await request.body()
     headers = upstream_proxy_headers(request)
     target = f"{settings.new_api_base_url}/{clean_path}"
-    async with httpx.AsyncClient(timeout=120.0, follow_redirects=False) as client:
-        upstream = await client.request(
-            request.method,
-            target,
-            content=body,
-            params=request.query_params,
-            headers=headers,
-        )
+    upstream_started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=False) as client:
+            upstream = await client.request(
+                request.method,
+                target,
+                content=body,
+                params=request.query_params,
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("new-api proxy failed path=/%s error=%s", clean_path, exc)
+        raise HTTPException(status_code=502, detail="upstream request failed") from exc
+    _record_upstream_timing(
+        request,
+        "",
+        f"/{clean_path}",
+        upstream.status_code,
+        (time.monotonic() - upstream_started) * 1000.0,
+    )
     content = upstream.content
     if request.method == "GET" and clean_path == "api/user/self" and upstream.status_code == 200:
         content = augment_customer_self_response(
