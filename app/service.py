@@ -14,8 +14,6 @@ from app.payments import PaymentIntent, PaymentNotification
 from app.security import generate_device_key, hash_key, mask_key
 
 
-SYSTEM_QUOTA_DAYS = 3650
-
 # Read paths no longer force a write sweep on every call; the timeout sweep is
 # throttled to avoid turning GET handlers into unconditional writers.
 EXPIRE_SWEEP_INTERVAL_SECONDS = 30

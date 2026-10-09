@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from app.config import load_settings
@@ -28,24 +27,19 @@ from app.service import (
     renew_device,
     rotate_device_key,
 )
+from app.util import fmt_ts
 
 
 # The upstream chat model that the compatibility alias resolves to when it is
-# present in a plan. Kept as the local fallback so the CLI mirrors
-# ``app.main.default_chat_model`` without importing the heavy FastAPI app.
-DEFAULT_CHAT_MODEL = "deepseek-v4.1-flash"
+# present in a plan. Derived from the database defaults so this stays a single
+# source of truth instead of a second hardcoded literal that could drift.
+DEFAULT_CHAT_MODEL = DEFAULT_CHAT_MODELS.split(",", 1)[0].strip()
 
 # Upper bounds for ``import-devices`` so a mistaken large file cannot exhaust
 # memory or the database. Callers may still import more devices in several
 # smaller batches.
 MAX_IMPORT_BYTES = 1 * 1024 * 1024
 MAX_IMPORT_LINES = 10_000
-
-
-def fmt_ts(value: int | None) -> str:
-    if not value:
-        return "-"
-    return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def split_model_list(value: object) -> list[str]:

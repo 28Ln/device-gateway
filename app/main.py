@@ -51,6 +51,7 @@ from app.service import (
     save_payment_intent,
 )
 from app.security import hash_key, mask_key, verify_bind_code
+from app.util import fmt_ts
 from app.payments import (
     MockPaymentProvider,
     PaymentError,
@@ -91,7 +92,8 @@ SAFE_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._~:-]+$")
 DEEPSEEK_MODELS = {"deepseek-v4.1-flash"}
 WEB_SEARCH_MODELS = {"gpt-5.5"}
 DEFAULT_IMAGE_MODELS = {"[b2]gpt-image-2"}
-DEFAULT_IMAGE_MODEL_TEXT = "[b2]gpt-image-2"
+# Derived from the model set above so the two never drift apart.
+DEFAULT_IMAGE_MODEL_TEXT = sorted(DEFAULT_IMAGE_MODELS)[0]
 BTF_CHAT_ALIAS = "btf-chat"
 BTF_IMAGE_ALIAS = "btf-image"
 ACTIVE_REQUESTS: dict[str, int] = {}
@@ -164,12 +166,6 @@ class DashboardUser:
         return self.role >= ADMIN_ROLE
 
 app = FastAPI(title="BTF Device Gateway")
-
-
-def fmt_ts(value: int | None) -> str:
-    if not value:
-        return "-"
-    return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def bearer_token(authorization: str | None) -> str:
@@ -476,8 +472,9 @@ def plan_alias(plan: dict[str, Any], key: str, fallback: str) -> str:
 
 def default_chat_model(chat_models: set[str]) -> str:
     """Return the model used when a client selects the btf-chat alias."""
-    if "deepseek-v4.1-flash" in chat_models:
-        return "deepseek-v4.1-flash"
+    for model in sorted(DEEPSEEK_MODELS):
+        if model in chat_models:
+            return model
     return sorted(chat_models)[0]
 
 
@@ -1153,7 +1150,7 @@ def normalized_device_statuses(status: str) -> list[str]:
     return list(dict.fromkeys(requested))
 
 
-def new_api_page(items: list[dict[str, Any]], page: int, page_size: int, total: int | None = None) -> dict[str, Any]:
+def paginate(items: list[dict[str, Any]], page: int, page_size: int, total: int | None = None) -> dict[str, Any]:
     """Build a page envelope.
 
     When ``total`` is provided the caller has already paginated (e.g. in SQL)
@@ -1257,7 +1254,7 @@ async def api_list_devices(
             ).fetchall()
         ]
     items = [device_row_to_new_api(row) for row in rows]
-    return {"success": True, "message": "", "data": new_api_page(items, p, page_size, total)}
+    return {"success": True, "message": "", "data": paginate(items, p, page_size, total)}
 
 
 @app.post("/api/device/")

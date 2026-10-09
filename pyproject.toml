@@ -1,18 +1,16 @@
+# NOTE: runtime dependencies intentionally live in ``requirements.txt`` as the
+# single source of truth (Docker builds install that file directly). The list
+# used to be duplicated here, which drifted easily; do not re-add it — update
+# requirements.txt instead.
 [project]
 name = "btf-device-gateway"
 version = "0.1.0"
 description = "Device-first authorization gateway for BTF API"
 requires-python = ">=3.11"
-dependencies = [
-  "fastapi==0.115.6",
-  "uvicorn[standard]==0.34.0",
-  "httpx==0.28.1",
-  "pydantic==2.10.4",
-  "python-multipart==0.0.20",
-  "cryptography==41.0.7",
-]
+dependencies = []
 
 [project.optional-dependencies]
+# Test-only dependencies; see requirements-dev.txt for the CLI-installable view.
 test = [
   "pytest==8.3.4",
 ]
