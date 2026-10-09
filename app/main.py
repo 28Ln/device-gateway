@@ -3580,6 +3580,12 @@ async def proxy_v1(path: str, request: Request, authorization: str | None = Head
         )
         logger.warning("upstream request failed path=/v1/%s error=%s", clean_path, exc)
         _release_active_request(auth.device_id, user_id)
+        if isinstance(exc, httpx.HTTPError):
+            # Upstream transport failure (connect/timeout/protocol): mirror the
+            # sibling proxy_new_api contract with a structured 502 instead of a
+            # bare 500. Cancellation/interrupt (BaseException, CancelledError)
+            # is never an HTTPError, so it still propagates unchanged below.
+            raise HTTPException(status_code=502, detail="upstream request failed") from exc
         raise
     _record_upstream_timing(
         request,
