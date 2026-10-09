@@ -38,6 +38,7 @@ from app.config import load_settings, normalize_origin
 from app.db import DEFAULT_CHAT_MODELS, connect
 from app.db import now_ts
 from app.service import (
+    MAX_EXPIRES_AT,
     DeviceError,
     approve_order,
     apply_payment_notification,
@@ -104,9 +105,9 @@ BTF_IMAGE_ALIAS = "btf-image"
 ACTIVE_REQUESTS: dict[str, int] = {}
 ACTIVE_USER_REQUESTS: dict[int, int] = {}
 MAX_GENERATED_IMAGE_BYTES = 25 * 1024 * 1024
-# Upper bound for a device/plan expiry (~100 years) so a typo such as an
-# unusually large epoch cannot produce a nonsensical "forever" licence.
-MAX_EXPIRES_AT = 4_102_444_800
+# Upper bound for a device/plan expiry is imported from ``app.service``
+# (``MAX_EXPIRES_AT``) so the Web and CLI/service layers share one source of
+# truth and CLI-produced expiries are always accepted on write-back.
 MAX_PAGE_SIZE = 200
 # SQLite stores integers as signed 64-bit; a value outside this range raises
 # OverflowError when bound to a query, so it must be rejected at the edge.

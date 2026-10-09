@@ -73,6 +73,23 @@ Production MUST set it to the public HTTPS domain (see "Real payment
 activation" below). The gateway has no separate admin username/password or
 internal admin token; administrative access is the existing New API session.
 
+### Runtime / storage / cost estimation
+
+```text
+BTF_DATA_DIR=./data
+BTF_ORDER_EXPIRES_SECONDS=86400
+BTF_CHAT_PROMPT_COST_PER_MILLION=0
+BTF_CHAT_COMPLETION_COST_PER_MILLION=0
+BTF_IMAGE_COST_PER_REQUEST=0
+BTF_LOG_LEVEL=INFO
+BTF_PAYMENT_NOTIFY_RATE_LIMIT=60
+BTF_PAYMENT_NOTIFY_MAX_BODY_BYTES=262144
+```
+
+None of these are secrets. `BTF_DATA_DIR` selects the SQLite database and
+generated-image directory. The three cost variables default to `0` (cost
+estimation disabled); set them only to enable usage cost accounting.
+
 ### Local payment test
 
 ```text
