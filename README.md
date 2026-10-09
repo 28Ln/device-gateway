@@ -10,7 +10,7 @@ plans, renewal orders, payment callbacks, and device usage counters.
 Public clients use a device key:
 
 ```text
-Authorization: Bearer BTF:AI:01:01:00:01
+Authorization: Bearer BTF:AI:01:01:00:01   # initial key == device_id
 Base URL: http://115.191.10.45/v1
 Default model: deepseek-v4.1-flash
 Optional model: gpt-5.5 (web search enabled)
@@ -33,6 +33,12 @@ python -m app.cli list-devices
 python -m app.cli approve-order ORDER_ID
 ```
 
+`create-device`, `batch-create`, `import-devices`, and `rotate-key` print the
+device key masked by default so full credentials do not leak into shell history
+or logs. Add `--show-secret` only when the key genuinely needs to be provisioned
+to hardware. The `model=` line they print is derived from the configured plans,
+not hardcoded.
+
 ## Device API
 
 - `/api/device/status` returns JSON status for firmware or apps.
@@ -44,12 +50,16 @@ normal New API login and do not need a second gateway token for dashboard pages.
 
 ## Users and Device Binding
 
-- `device_id` is the stable device identifier, currently the device MAC.
-- The device MAC is also the API key used for `/v1` calls.
+- `device_id` is the stable device identifier, currently the device MAC. It is
+  the device's lookup identity and is never accepted as a credential on its own.
+- A newly created device starts with an API key equal to its `device_id`. This is
+  a convenience default for first provisioning, not a permanent equivalence: the
+  gateway stores only `sha256(key)`, so the API key is a separate credential from
+  the identifier.
 - Devices can be bound to a user during single creation, prefix batch creation, or newline-based device identifier import.
-- New devices use their MAC as the initial API key. An administrator can rotate
-  a device key for security; after rotation the old MAC key is invalid and the
-  hardware must be provisioned with the new key.
+- An administrator can rotate a device key for security. After rotation the key
+  is a random value that no longer equals the MAC / `device_id`; the old key is
+  immediately invalid and the hardware must be provisioned with the new key.
 
 ## End-to-End Usage
 

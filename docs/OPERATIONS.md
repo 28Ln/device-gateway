@@ -38,6 +38,15 @@ the database.
 Do not replace the mounted `new-api-dist` directory with a different build
 unless the dashboard routes and device menu have been verified.
 
+The `new-api-dist/` and `new-api-dist.bak.*/` trees are ignored by `.gitignore`
+and may be mounted into the container. They are large; if a future cleanup wants
+to shrink the repository or image, treat their removal as a separate, verified
+change rather than deleting them casually.
+
+A stray zero-byte `btf.db` used to sit in the repository root. It was never the
+gateway database (whose name is `btf-device-gateway.sqlite3`) and has been
+removed. `btf.db` is also listed in `.gitignore` to prevent it reappearing.
+
 ## Environment groups
 
 ### Core
@@ -46,6 +55,17 @@ unless the dashboard routes and device menu have been verified.
 PUBLIC_BASE_URL
 NEW_API_BASE_URL
 NEW_API_TOKEN
+```
+
+Only the variables above are read on the request path. Customer and admin
+requests are authenticated with the existing New API session, so no BTF-specific
+token or login is used.
+
+The following names are accepted by `app/config.py` but are currently **not used
+by any code path**; they are kept only for backward compatibility and do not need
+to be set:
+
+```text
 INTERNAL_ADMIN_TOKEN
 BTF_ADMIN_USERNAME
 BTF_ADMIN_PASSWORD

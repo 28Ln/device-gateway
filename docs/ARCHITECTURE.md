@@ -101,6 +101,9 @@ Repeated provider callbacks do not extend twice.
 ## Admin/customer endpoint behavior
 
 The dashboard uses the existing New API session cookie or access token. It does
-not use `INTERNAL_ADMIN_TOKEN`, `NEW_API_TOKEN`, or a separate BTF admin login.
-`INTERNAL_ADMIN_TOKEN` is reserved for server-side operations and is never sent
-to a browser.
+not use a separate BTF admin token or login.
+
+`INTERNAL_ADMIN_TOKEN`, `BTF_ADMIN_USERNAME`, and `BTF_ADMIN_PASSWORD` are still
+read by `app/config.py` but are not used by any current code path, so they are
+not required. If a future feature consumes them, they must remain server-side
+only and never be sent to a browser.
