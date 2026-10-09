@@ -1796,13 +1796,20 @@ async def api_create_device(
     resolved_key = device_key or mac
     if not mac or not expires_at:
         return {"success": False, "message": "invalid params"}
-    if status not in {"active", "disabled"}:
+    # ``expired`` is accepted as a stored status so an explicit past expiry can
+    # be represented without ever persisting the inconsistent active+expired
+    # combination; the stored status simply must match the expiry.
+    if status not in {"active", "disabled", "expired"}:
         return {"success": False, "message": "invalid status"}
     ts = now_ts()
     if status == "active":
         expires_at = positive_expires_at(payload.get("expires_at"), "expires_at")
         if expires_at <= ts:
             return {"success": False, "message": "expires_at must be in the future for an active device"}
+    elif status == "expired":
+        expires_at = positive_expires_at(payload.get("expires_at"), "expires_at")
+        if expires_at > ts:
+            return {"success": False, "message": "expires_at must be in the past for an expired device"}
     note = compose_note(
         str(payload.get("name") or ""),
         str(payload.get("plan") or ""),
@@ -1873,7 +1880,9 @@ async def api_update_device(
     bind_code = normalize_bind_code(payload.get("bind_code"))
     if not device_id or not mac or not expires_at:
         return {"success": False, "message": "invalid params"}
-    if status not in {"active", "disabled"}:
+    # See ``api_create_device``: ``expired`` is a valid stored status as long as
+    # it matches a past expiry, so an update can never write active+expired.
+    if status not in {"active", "disabled", "expired"}:
         return {"success": False, "message": "invalid status"}
     note = compose_note(
         str(payload.get("name") or ""),
@@ -1885,6 +1894,10 @@ async def api_update_device(
         expires_at = positive_expires_at(payload.get("expires_at"), "expires_at")
         if expires_at <= ts:
             return {"success": False, "message": "expires_at must be in the future for an active device"}
+    elif status == "expired":
+        expires_at = positive_expires_at(payload.get("expires_at"), "expires_at")
+        if expires_at > ts:
+            return {"success": False, "message": "expires_at must be in the past for an expired device"}
     with connect(settings.database_path) as conn:
         if user_id is not None:
             user = conn.execute("select id from users where id = ?", (user_id,)).fetchone()
@@ -2099,13 +2112,23 @@ async def api_manage_device(
         if not row:
             return {"success": False, "message": "device not found"}
         if action == "enable":
-            # Enabling must never leave a device both ``active`` and already
-            # expired. If the stored expiry has lapsed, require the caller to
-            # extend it in the same request (renew semantics) to at least now.
+            # Enabling must never yield (or leave behind) a device that is both
+            # ``active`` and already ``expired``. The stored expiry is the
+            # authority: if it has lapsed, the row is normalised to ``disabled``
+            # unless the caller explicitly renews it in the same request with a
+            # future ``expires_at``. Fixing the row here also repairs historic
+            # data where a device was somehow stored as active+expired, so
+            # calling enable never *keeps* such an inconsistent state.
             current_expires_at = int(row["expires_at"] or 0)
             if current_expires_at <= ts:
                 requested = int_or_400(payload.get("expires_at"), "expires_at")
                 if requested <= ts:
+                    # No valid renewal supplied: converge the residual
+                    # active+expired row to ``disabled`` (never active+expired).
+                    conn.execute(
+                        "update devices set status = 'disabled', updated_at = ? where id = ?",
+                        (ts, device_id),
+                    )
                     return {
                         "success": False,
                         "message": "device has expired; provide expires_at in the future to enable it",
