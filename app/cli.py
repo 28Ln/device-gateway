@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import datetime
+from pathlib import Path
 
 from app.config import load_settings
+from app.db import DEFAULT_CHAT_MODELS, connect
+from app.security import mask_key
 from app.service import (
     DeviceError,
     approve_order,
@@ -26,10 +30,76 @@ from app.service import (
 )
 
 
+# The upstream chat model that the compatibility alias resolves to when it is
+# present in a plan. Kept as the local fallback so the CLI mirrors
+# ``app.main.default_chat_model`` without importing the heavy FastAPI app.
+DEFAULT_CHAT_MODEL = "deepseek-v4.1-flash"
+
+# Upper bounds for ``import-devices`` so a mistaken large file cannot exhaust
+# memory or the database. Callers may still import more devices in several
+# smaller batches.
+MAX_IMPORT_BYTES = 1 * 1024 * 1024
+MAX_IMPORT_LINES = 10_000
+
+
 def fmt_ts(value: int | None) -> str:
     if not value:
         return "-"
     return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def split_model_list(value: object) -> list[str]:
+    models: list[str] = []
+    for item in str(value or "").replace("\n", ",").split(","):
+        item = item.strip()
+        if item and item not in models:
+            models.append(item)
+    return models
+
+
+def default_chat_model(models: list[str]) -> str:
+    """Pick the gateway default chat model from a plan's model list."""
+    if DEFAULT_CHAT_MODEL in models:
+        return DEFAULT_CHAT_MODEL
+    if models:
+        return sorted(models)[0]
+    fallback = split_model_list(DEFAULT_CHAT_MODELS)
+    return fallback[0] if fallback else DEFAULT_CHAT_MODEL
+
+
+def derive_default_model(database_path: Path) -> str:
+    """Derive the default chat model from the plans stored in the database.
+
+    This keeps CLI output aligned with whatever the administrator has
+    configured for the enabled plans instead of hardcoding a model name.
+    """
+    try:
+        with connect(database_path) as conn:
+            rows = conn.execute(
+                """
+                select chat_models from plans
+                where enabled = 1
+                order by sort_order, price_amount
+                """
+            ).fetchall()
+    except Exception:
+        rows = []
+    models: list[str] = []
+    for row in rows:
+        for model in split_model_list(row["chat_models"]):
+            if model not in models:
+                models.append(model)
+    return default_chat_model(models)
+
+
+def emit_api_key(key: str, show_secret: bool = False) -> None:
+    """Print a device key without leaking the raw secret by default.
+
+    The mask keeps the value recognisable for operators while avoiding the full
+    credential appearing in shell history, logs, or screenshots. Pass
+    ``--show-secret`` when the full key genuinely needs to be provisioned.
+    """
+    print(f"api_key={key if show_secret else mask_key(key)}")
 
 
 def cmd_init_db(args: argparse.Namespace) -> None:
@@ -69,9 +139,9 @@ def cmd_create_device(args: argparse.Namespace) -> None:
     ensure_ready(settings.database_path)
     key, device = create_device(settings.database_path, args.device_id, args.days, args.note, args.user_id)
     print(f"device_id={device['device_id']}")
-    print(f"api_key={key}")
+    emit_api_key(key, args.show_secret)
     print(f"base_url={settings.public_base_url}/v1")
-    print("model=deepseek-v4.1-flash")
+    print(f"model={derive_default_model(settings.database_path)}")
     print(f"expires_at={fmt_ts(device['expires_at'])}")
 
 
@@ -79,30 +149,45 @@ def cmd_batch_create(args: argparse.Namespace) -> None:
     settings = load_settings()
     ensure_ready(settings.database_path)
     rows = batch_create_devices(settings.database_path, args.prefix, args.count, args.days, args.note, args.user_id)
+    model = derive_default_model(settings.database_path)
     print("device_id,api_key,base_url,model,expires_at")
     for key, device in rows:
+        shown = key if args.show_secret else mask_key(key)
         print(
-            f"{device['device_id']},{key},{settings.public_base_url}/v1,"
-            f"deepseek-v4.1-flash,{fmt_ts(device['expires_at'])}"
+            f"{device['device_id']},{shown},{settings.public_base_url}/v1,"
+            f"{model},{fmt_ts(device['expires_at'])}"
         )
+
+
+def read_import_source(path: str) -> str:
+    """Read import-devices input with a size cap to bound memory use."""
+    if path == "-":
+        raw = sys.stdin.read(MAX_IMPORT_BYTES + 1)
+        if len(raw.encode("utf-8", errors="ignore")) > MAX_IMPORT_BYTES:
+            raise ValueError(f"input exceeds maximum size of {MAX_IMPORT_BYTES} bytes")
+        return raw
+    size = Path(path).stat().st_size
+    if size > MAX_IMPORT_BYTES:
+        raise ValueError(f"file exceeds maximum size of {MAX_IMPORT_BYTES} bytes: {path}")
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read()
 
 
 def cmd_import_devices(args: argparse.Namespace) -> None:
     settings = load_settings()
     ensure_ready(settings.database_path)
-    if args.file == "-":
-        import sys
-
-        raw = sys.stdin.read()
-    else:
-        with open(args.file, "r", encoding="utf-8") as handle:
-            raw = handle.read()
-    rows = import_devices(settings.database_path, raw.splitlines(), args.days, args.note, args.user_id)
+    raw = read_import_source(args.file)
+    lines = raw.splitlines()
+    if len(lines) > MAX_IMPORT_LINES:
+        raise ValueError(f"input exceeds maximum of {MAX_IMPORT_LINES} lines")
+    rows = import_devices(settings.database_path, lines, args.days, args.note, args.user_id)
+    model = derive_default_model(settings.database_path)
     print("device_id,api_key,base_url,model,expires_at")
     for key, device in rows:
+        shown = key if args.show_secret else mask_key(key)
         print(
-            f"{device['device_id']},{key},{settings.public_base_url}/v1,"
-            f"deepseek-v4.1-flash,{fmt_ts(device['expires_at'])}"
+            f"{device['device_id']},{shown},{settings.public_base_url}/v1,"
+            f"{model},{fmt_ts(device['expires_at'])}"
         )
 
 
@@ -200,9 +285,9 @@ def cmd_rotate_key(args: argparse.Namespace) -> None:
     ensure_ready(settings.database_path)
     key, device = rotate_device_key(settings.database_path, args.device_id)
     print(f"device_id={device['device_id']}")
-    print(f"api_key={key}")
+    emit_api_key(key, args.show_secret)
     print(f"base_url={settings.public_base_url}/v1")
-    print("model=deepseek-v4.1-flash")
+    print(f"model={derive_default_model(settings.database_path)}")
 
 
 def cmd_list_usage(args: argparse.Namespace) -> None:
@@ -245,6 +330,11 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--days", type=int, default=30)
     create.add_argument("--note", default="")
     create.add_argument("--user-id", type=int)
+    create.add_argument(
+        "--show-secret",
+        action="store_true",
+        help="print the full device key instead of a mask (only when provisioning)",
+    )
     create.set_defaults(func=cmd_create_device)
 
     batch = sub.add_parser("batch-create")
@@ -253,6 +343,11 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("--days", type=int, default=30)
     batch.add_argument("--note", default="")
     batch.add_argument("--user-id", type=int)
+    batch.add_argument(
+        "--show-secret",
+        action="store_true",
+        help="print full device keys instead of masks (only when provisioning)",
+    )
     batch.set_defaults(func=cmd_batch_create)
 
     import_cmd = sub.add_parser("import-devices")
@@ -260,6 +355,11 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd.add_argument("--days", type=int, default=30)
     import_cmd.add_argument("--note", default="")
     import_cmd.add_argument("--user-id", type=int)
+    import_cmd.add_argument(
+        "--show-secret",
+        action="store_true",
+        help="print full device keys instead of masks (only when provisioning)",
+    )
     import_cmd.set_defaults(func=cmd_import_devices)
 
     get = sub.add_parser("get-device")
@@ -298,6 +398,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     rotate = sub.add_parser("rotate-key")
     rotate.add_argument("device_id")
+    rotate.add_argument(
+        "--show-secret",
+        action="store_true",
+        help="print the full device key instead of a mask (only when provisioning)",
+    )
     rotate.set_defaults(func=cmd_rotate_key)
 
     usage = sub.add_parser("list-usage")
@@ -313,7 +418,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         args.func(args)
-    except DeviceError as exc:
+    except (DeviceError, ValueError) as exc:
         raise SystemExit(f"error: {exc}") from exc
 
 

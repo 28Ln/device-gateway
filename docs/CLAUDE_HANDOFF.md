@@ -1,6 +1,6 @@
 # BTF API 项目交接总文档
 
-更新时间：2026-09-29（Asia/Shanghai）
+更新时间：2026-10-09（Asia/Shanghai）
 
 本文档用于把当前 BTF API / New API 项目交给下一位开发者或 Claude 继续维护。文档以当前工作区、线上容器和数据库实测结果为准，不以历史聊天中的计划或未验证描述为准。
 
@@ -40,7 +40,7 @@ New API 用户账号
 - 用户只能看到自己绑定的设备、订单、用量和图片。
 - 管理员可以查看和管理全部设备。
 - 客户用量兼容 New API 原有日志、统计和图表接口。
-- 全量 Python 测试 `38 passed`。
+- 全量 Python 测试 `49 passed`（截至本次快照）。
 
 尚未完成或需要外部资料才能完成：
 
@@ -150,16 +150,15 @@ BTF Gateway 依赖：
 - 分支：`master`
 - 没有配置 Git remote。
 - 工作区存在未提交修改，不能执行 `git reset --hard` 或覆盖这些修改。
-- 当前 HEAD：`05eed53 Add generated image listing API`
+- 当前 HEAD：`36f88bb Fix btf-chat alias default, migrate plan models, paginate usage logs`
 - 近期关键提交：
-  - `dbbf3a4 Implement BTF device gateway`
-  - `60edb6f Complete device management and renewal flows`
-  - `a7a5dea Complete device gateway operations and payment readiness`
-  - `fc858c6 Use one GPT image model for device plans`
+  - `825a11c Hide internal device plan limits from customers`
   - `4c2b5bf Add user-level device usage controls`
+  - `4e42f86 Add device order close and expiry flow`
   - `d964694 Persist generated device images`
   - `05eed53 Add generated image listing API`
-- 本文档 `docs/CLAUDE_HANDOFF.md` 当前属于工作区新增文件，交接前应随代码一起保留；是否提交由接手者决定。
+  - `36f88bb Fix btf-chat alias default, migrate plan models, paginate usage logs`
+- 本文档 `docs/CLAUDE_HANDOFF.md` 是版本库中的既有文件，交接时应随代码一起保留。
 
 ## 3. 系统所有权边界
 
@@ -184,7 +183,8 @@ BTF Gateway 依赖：
 - 客户不能拿到 `NEW_API_TOKEN`。
 - 客户浏览器使用 New API 的 Access Token / HttpOnly Refresh Cookie。
 - 设备 Key 和浏览器登录不是同一种凭据。
-- `INTERNAL_ADMIN_TOKEN` 不是客户登录密码，不应发送给浏览器。
+- `INTERNAL_ADMIN_TOKEN`、`BTF_ADMIN_USERNAME`、`BTF_ADMIN_PASSWORD` 仍被
+  `app/config.py` 读取，但当前没有任何代码路径使用，属于历史遗留，不是必需配置。
 
 ## 4. 用户、设备和 MAC Key 模型
 
@@ -212,8 +212,8 @@ New API user.id
 创建设备时：
 
 ```text
-device_id = 设备 MAC
-current_key = device_id
+device_id = 设备 MAC（稳定标识）
+current_key = device_id     # 初始便捷值，不是永久等价
 ```
 
 硬件请求：
@@ -222,7 +222,9 @@ current_key = device_id
 Authorization: Bearer <MAC-or-current-device-key>
 ```
 
-MAC 应规范化为大写并去除首尾空格。设备 Key 不是直接明文存储，数据库保存哈希和显示掩码。
+MAC 应规范化为大写并去除首尾空格。设备 Key 不是直接明文存储，数据库只保存
+`sha256(key)` 哈希和显示掩码。`device_id` 是查找身份，本身不能单独作为网关凭据；
+初始 Key 为了方便首次配网才等于 `device_id`，轮换后二者不再相等。
 
 ### 4.3 换 Key
 
@@ -231,8 +233,22 @@ MAC 应规范化为大写并去除首尾空格。设备 Key 不是直接明文�
 - 设备身份 `device_id` 不变。
 - 用户绑定不变。
 - 套餐、订单、用量不变。
+- 新 Key 是随机值，不再等于 MAC / `device_id`。
 - 旧 Key 立即失效。
 - 硬件必须更新为新 Key。
+
+### 4.4 绑定码（bind_code）
+
+管理员可以在创建设备时配置绑定码（`bind_code` / `generate_bind_code`）。绑定码
+是一个短口令，用于把已创建的设备认领到当前登录用户：
+
+```text
+POST /api/device/bind   {mac, bind_code}
+```
+
+网关只保存 `hash(bind_code)` 和 `bind_code_mask`，校验通过后写入 `user_id` 与
+`bound_at`。绑定码不是设备 API Key，也不用于 `/v1` 调用。已绑定他用户的设备会
+拒绝再次绑定。
 
 ## 5. 设备管理功能
 
@@ -623,7 +639,7 @@ data.items = []
 当前全量测试：
 
 ```text
-38 passed, 1 warning
+49 passed, 1 warning
 ```
 
 覆盖：
@@ -640,6 +656,7 @@ data.items = []
 - 客户用量接口。
 - 图片保存和客户隔离。
 - 路径穿越防护。
+- CLI 输出脱敏（`api_key` 默认掩码）、模型来源派生和导入上限。
 
 运行：
 
@@ -690,7 +707,7 @@ docker run --rm \
 本次在 Docker 测试环境重新运行：
 
 ```text
-38 passed, 1 warning in 1.82s
+49 passed, 1 warning
 ```
 
 宿主机 `/opt/btf-device-gateway` 的系统 Python 没有安装 pytest，因此测试使用
@@ -737,11 +754,13 @@ Android 端接手要求：
 ### P0：真实支付上线前
 
 - 配置 HTTPS 域名。
-- 设置 `SESSION_COOKIE_SECURE=true`。
 - 配置可信 Origin。
 - 配置微信或支付宝生产资料。
 - 验证支付回调签名、金额、币种、交易号和幂等。
 - 禁止在生产开启 Mock 支付。
+
+> 注：会话 Cookie 的安全属性由 New API 容器配置，本仓库没有
+> `SESSION_COOKIE_SECURE` 环境变量，不要在本项目设置它。
 
 ### P1：Android 客户端
 
@@ -812,7 +831,7 @@ Claude 或下一位开发者接手时必须遵守：
 - BTF Gateway 负责设备 MAC、设备 Key、用户绑定、套餐、限额、订单、支付回调、设备用量和图片落盘。
 - 客户和管理员使用现有 New API Dashboard，不要新建独立风格的后台。
 - 设备通过 Authorization: Bearer <device-key> 调用 /v1。
-- 初始设备 Key 等于 MAC；换 Key 后旧 Key 必须失效。
+- 初始设备 Key 等于 MAC；换 Key 后 Key 变为随机值且不再等于 MAC，旧 Key 必须失效。
 - DeepSeek 默认；gpt-5.5 可选并自动追加 web_search；月卡可使用 btf-image。
 
 开始任何修改前：
