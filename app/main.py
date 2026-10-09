@@ -28,8 +28,9 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from starlette.background import BackgroundTask
+from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.config import load_settings
+from app.config import load_settings, normalize_origin
 from app.db import DEFAULT_CHAT_MODELS, connect
 from app.db import now_ts
 from app.service import (
@@ -167,6 +168,92 @@ class DashboardUser:
 
 app = FastAPI(title="BTF Device Gateway")
 
+# Methods that can change state and therefore need cross-site request forgery
+# protection when the caller is authenticated by a browser session cookie.
+STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def login_required(authorization: str | None) -> bool:
+    """True when a state-changing request must prove same-origin.
+
+    Browser dashboard sessions are carried in cookies, which are attached to
+    requests automatically and so are forgeable from a third-party site. A
+    plain device key sent as ``Authorization: Bearer ...`` is deliberately
+    supplied by the caller and is not attached automatically, so those callers
+    (the ``/v1`` device API, server-to-server integrations) are exempt.
+    """
+    if authorization and authorization.lower().startswith("bearer "):
+        return False
+    return True
+
+
+def request_origins(request: Request) -> list[str]:
+    """Collect every Origin/Referer value the request presents."""
+    values: list[str] = []
+    origin = request.headers.get("origin")
+    if origin:
+        values.append(origin)
+    referer = request.headers.get("referer") or request.headers.get("referrer")
+    if referer:
+        values.append(referer)
+    return values
+
+
+def cross_origin_rejection(request: Request) -> HTTPException | None:
+    """Return a 403 when the request comes from a disallowed site.
+
+    Any presented Origin/Referer that is not on the allow-list is rejected.
+    When neither header is present the request is treated as non-browser (or a
+    same-origin navigation): cookie-authenticated callers are then still
+    allowed because a plain HTML form cannot set a custom Origin, while a
+    forged cross-site POST always carries one. Bearer callers are never
+    affected. This keeps the device-key ``/v1`` API, payment-gateway webhooks
+    and server-to-server integrations working unchanged.
+    """
+    if request.method not in STATE_CHANGING_METHODS:
+        return None
+    if not login_required(request.headers.get("authorization")):
+        # Bearer callers (device /v1 API, server-to-server) are not
+        # cookie-authenticated and are never forgeable cross-site.
+        return None
+    values = request_origins(request)
+    if not values:
+        return None
+    allowed = set(settings.allowed_origins)
+    if any(normalize_origin(value) not in allowed for value in values):
+        return HTTPException(status_code=403, detail="cross-origin request rejected")
+    return None
+
+
+class CrossOriginProtectionMiddleware(BaseHTTPMiddleware):
+    """Reject disallowed cross-site state-changing requests.
+
+    The middleware looks at raw headers and never calls ``request.json()``, so
+    it cannot conflict with a downstream ``request.form()`` body read.
+    """
+
+    async def dispatch(self, request: Request, call_next: Callable[[Request], Any]) -> Response:
+        rejection = cross_origin_rejection(request)
+        if rejection is not None:
+            return JSONResponse(status_code=rejection.status_code, content={"detail": rejection.detail})
+        return await call_next(request)
+
+
+def same_origin_guard(
+    request: Request | None,
+    authorization: str | None,
+) -> None:
+    """Re-assert the Origin/Referer check inside cookie-authenticated handlers.
+
+    This makes the protection testable and keeps it effective even if the
+    application is instantiated without the middleware (e.g. embedded tests).
+    """
+    if request is None or not login_required(authorization):
+        return
+    rejection = cross_origin_rejection(request)
+    if rejection is not None:
+        raise rejection
+
 
 def bearer_token(authorization: str | None) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -245,6 +332,10 @@ async def resolve_dashboard_user(
     authorization: str | None,
 ) -> DashboardUser:
     """Resolve the browser's new-api session without using the internal token."""
+    # Defence in depth: the middleware already blocks cross-site writes, but
+    # the dashboard auth path re-checks so cookie-authenticated state changes
+    # are safe even if the middleware is bypassed or absent.
+    same_origin_guard(request, authorization)
     headers: dict[str, str] = {}
     if authorization:
         headers["authorization"] = authorization
@@ -3047,3 +3138,8 @@ async def proxy_new_api(path: str, request: Request) -> Response:
 @app.exception_handler(DeviceError)
 async def device_error_handler(_: Request, exc: DeviceError) -> JSONResponse:
     return JSONResponse(status_code=403, content={"error": str(exc), "timestamp": now_ts()})
+
+
+# Registered last so it wraps every route (including the catch-all proxies).
+# Uses raw headers only, so it does not interfere with request body parsing.
+app.add_middleware(CrossOriginProtectionMiddleware)

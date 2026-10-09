@@ -14,6 +14,9 @@ services:
       BTF_DATA_DIR: /data
       # Production MUST set this to the public HTTPS domain.
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:8080}
+      # Trusted browser origins for CSRF checks. Defaults to the PUBLIC_BASE_URL
+      # origin; set to a comma-separated list to allow extra dashboard hosts.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
       NEW_API_BASE_URL: ${NEW_API_BASE_URL:-http://new-api:3000}
       # NEW_API_TOKEN is intentionally not listed here. Docker Compose injects an
       # empty string for an unset substitution without a default value, which
