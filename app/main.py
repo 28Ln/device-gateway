@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -1457,10 +1458,18 @@ def int_or_400(value: Any, field: str) -> int:
     Also rejects values outside SQLite's signed 64-bit range: binding such a
     value in a query raises ``OverflowError`` (HTTP 500), so an absurdly large
     integer in any JSON body must be turned into a 400 at the edge.
+
+    JSON permits numbers that parse to non-finite floats (``1e999`` -> ``inf``,
+    ``Infinity``/``-Infinity``/``NaN`` when the parser allows them). ``nan`` and
+    ``inf`` have no integer representation, and ``int(float('inf'))`` raises
+    ``OverflowError`` rather than ``ValueError``. Both are rejected explicitly
+    so a payload can never escape as a 500.
     """
+    if isinstance(value, float) and not math.isfinite(value):
+        raise HTTPException(status_code=400, detail=f"invalid {field}")
     try:
         parsed = int(value or 0)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise HTTPException(status_code=400, detail=f"invalid {field}") from exc
     if parsed < SQLITE_INT_MIN or parsed > SQLITE_INT_MAX:
         raise HTTPException(status_code=400, detail=f"invalid {field}")
@@ -1611,6 +1620,24 @@ def int_query_or_400(request: Request, name: str, default: int = 0) -> int:
     if value < SQLITE_INT_MIN or value > SQLITE_INT_MAX:
         raise HTTPException(status_code=400, detail=f"invalid {name}")
     return value
+
+
+async def json_body_or_400(request: Request) -> dict[str, Any]:
+    """Read a JSON request body, rejecting malformed/non-object input with 400.
+
+    ``Request.json()`` raises ``JSONDecodeError`` for malformed bodies (``{``,
+    ``not json``) and the subsequent ``payload.get(...)`` raises
+    ``AttributeError`` for non-object JSON (``[]``, ``"str"``, ``123``,
+    ``null``); both escaped as HTTP 500. Every write endpoint funnels through
+    here so such input answers 400 while valid object bodies are unchanged.
+    """
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON body") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    return payload
 
 
 def bounded_limit(value: int, default: int = 200, maximum: int = 1000) -> int:
@@ -1781,7 +1808,7 @@ async def api_create_device(
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
     require_admin(dashboard_user)
-    payload = await request.json()
+    payload = await json_body_or_400(request)
     user_id = optional_user_id(payload.get("user_id"))
     mac = normalize_mac(payload.get("mac"))
     expires_at = int_or_400(payload.get("expires_at"), "expires_at")
@@ -1863,7 +1890,7 @@ async def api_update_device(
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
     require_admin(dashboard_user)
-    payload = await request.json()
+    payload = await json_body_or_400(request)
     device_id = int_or_400(payload.get("id"), "id")
     user_id = optional_user_id(payload.get("user_id"))
     mac = normalize_mac(payload.get("mac"))
@@ -1923,6 +1950,15 @@ async def api_update_device(
                         "create a new device instead"
                     ),
                 )
+            # Refuse to rename onto an id that already exists. Without this the
+            # UNIQUE constraint fires inside the UPDATE and the raw SQLite
+            # schema/message would be echoed back to the caller.
+            clash = conn.execute(
+                "select 1 from devices where device_id = ? and id != ?",
+                (mac, device_id),
+            ).fetchone()
+            if clash:
+                raise HTTPException(status_code=400, detail="device id already exists")
         plan_started_at = ts if str(row["plan_id"] or "") != plan_id else None
         old_user_id = int(row["user_id"] or 0)
         next_user_id = user_id or 0
@@ -1957,6 +1993,10 @@ async def api_update_device(
                     device_id,
                 ),
             )
+        except sqlite3.IntegrityError as exc:
+            # Any remaining uniqueness violation (e.g. key_hash) is reported
+            # generically so internal schema details are never echoed back.
+            return {"success": False, "message": "device conflict"}
         except Exception as exc:
             return {"success": False, "message": str(exc)}
     return {"success": True, "message": "", "data": {"updated": True}}
@@ -1969,7 +2009,7 @@ async def api_batch_create_devices(
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
     require_admin(dashboard_user)
-    payload = await request.json()
+    payload = await json_body_or_400(request)
     user_id = optional_user_id(payload.get("user_id"))
     macs = split_macs(payload.get("macs"))
     expires_at = int_or_400(payload.get("expires_at"), "expires_at")
@@ -2051,7 +2091,7 @@ async def api_bind_device_to_current_user(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
-    payload = await request.json()
+    payload = await json_body_or_400(request)
     mac = normalize_mac(payload.get("mac"))
     bind_code = normalize_bind_code(payload.get("bind_code"))
     if not mac or not bind_code:
@@ -2086,7 +2126,7 @@ async def api_manage_device(
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
     require_admin(dashboard_user)
-    payload = await request.json()
+    payload = await json_body_or_400(request)
     device_id = int_or_400(payload.get("id"), "id")
     action = payload.get("action")
     expires_at = int_or_400(payload.get("expires_at"), "expires_at")
@@ -2180,7 +2220,7 @@ async def api_update_device_plan(
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
     require_admin(dashboard_user)
-    payload = await request.json()
+    payload = await json_body_or_400(request)
     with connect(settings.database_path) as conn:
         row = conn.execute("select * from plans where id = ?", (plan_id,)).fetchone()
         if not row:
@@ -2320,7 +2360,7 @@ async def api_start_device_payment(
     authorization: str | None = Header(default=None),
     x_idempotency_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    payload = await request.json()
+    payload = await json_body_or_400(request)
     provider_name = str(payload.get("provider") or "").strip().lower()
     if not provider_name:
         return {"success": False, "message": "provider is required"}
@@ -2364,7 +2404,7 @@ async def api_create_device_order(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    payload = await request.json()
+    payload = await json_body_or_400(request)
     mac = normalize_mac(payload.get("mac"))
     plan_id = str(payload.get("plan_id") or "").strip()
     if not mac or not plan_id:
@@ -2397,7 +2437,7 @@ async def api_close_device_order(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
-    payload = await request.json()
+    payload = await json_body_or_400(request)
     reason = str(payload.get("reason") or "manual").strip() or "manual"
     try:
         order = get_order(settings.database_path, order_id)
@@ -2422,7 +2462,7 @@ async def api_approve_device_order(
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
     require_admin(dashboard_user)
-    payload = await request.json()
+    payload = await json_body_or_400(request)
     order_id = str(payload.get("order_id") or "").strip()
     if not order_id:
         return {"success": False, "message": "invalid order_id"}
@@ -2914,7 +2954,13 @@ async def api_update_device_user_limits(
 ) -> dict[str, Any]:
     dashboard_user = await resolve_dashboard_user(request, authorization)
     require_admin(dashboard_user)
-    payload = await request.json()
+    # FastAPI's implicit int conversion has no int64 bound; re-read the raw
+    # path value so an absurd user_id answers 400 instead of raising
+    # OverflowError inside the SQL binding (same guard as api_get_device).
+    user_id = non_negative_int_or_400(
+        int_query_or_400(request, "user_id", user_id), "user_id"
+    )
+    payload = await json_body_or_400(request)
     fields = {
         "request_limit": 0,
         "daily_request_limit": 0,
