@@ -130,6 +130,7 @@ disabled unless `DEMO_PAYMENT_ENABLED=true`.
 - [Customer usage guide](docs/CUSTOMER_GUIDE.md)
 - [Deployment and payment setup](docs/OPERATIONS.md)
 - [Acceptance checklist](docs/ACCEPTANCE.md)
+- [Changelog by priority level](CHANGELOG.md)
 
 Run the read-only gateway smoke checks with:
 
@@ -141,3 +142,19 @@ BTF_DEVICE_KEY='BTF:AI:01:01:00:01' \
 
 Add `RUN_CHAT=1` to also send a short real request to
 `deepseek-v4.1-flash`.
+
+## Hardening status
+
+This tree has been hardened, optimized and verified by an isolated multi-agent
+pipeline (baseline `36f88bb`, 41 tests → current HEAD, 460 tests in-repo plus
+≈300 independent adversarial verification tests). See `CHANGELOG.md` for the
+full P0–P3 record. The verification pass closed every historical blocker family
+(SSRF, CSRF, device-key masking, referential integrity, migration safety,
+payment idempotency, unhandled-exception → 500, usage double-counting,
+`active`+expired state) and the last round added: structured `502` when the New
+API upstream is unreachable, CLI/service day+limit bounds, `/ready` schema
+validation, and single-sourced `MAX_EXPIRES_AT`. Reproduce with:
+
+```bash
+BTF_DATA_DIR=$(mktemp -d) python -m pytest -q
+```
